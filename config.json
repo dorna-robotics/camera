@@ -1,0 +1,18 @@
+{
+    "width": 1280,
+    "height": 720,
+    "fps": 15,
+    "stream": ["depth", "ir"],
+    "win_name": "Dorna_vision",
+    "visual_preset": 3,
+    "laser_power": 360,
+    "decimate_scale": 1,
+    "min_distance": 0,
+    "max_distance": 1,
+    "chess_pattern" : [9,6],
+    "time_out": 10,
+    "preset_path": "d435i.json",
+    "window_size": 16,
+    "image_save_path": "image_data/mushroom_",
+    "sync_save_path": "sync_data/"
+}
