@@ -1,5 +1,5 @@
 # Camera 
-This is the Python API repository that provides helper methods to use [D4XX Intel® RealSense™][realsense] camera. The API relies on [pyrealsense2][pyrealsense] library to get both RGB and depth frame. In addition to that, the API offers methods to sync your RealSense camera with [Dorna 2 Robotic arm][dorna].
+This is the Python API repository that provides helper methods to use [D4XX Intel® RealSense™][realsense] camera. The API relies on [pyrealsense2][pyrealsense] library to get both RGB and depth frame data. In addition to that, the API offers methods to sync your RealSense camera with [Dorna 2 Robotic arm][dorna].
 
 
 ## Installation
@@ -48,7 +48,7 @@ camera.off()
 The `config.json` file contains all the necessary configuration parameters for the camera. Read the `config.json` file as a Python dictionary and initiate the `camera` object. You can setup the path to the camera preset here as well. Go over the file to figure out different parameters.
 
 ### Methods
-Here is the list of methods available in for `camera` object.
+Here is the list of methods available for the `camera` object.
 
 #### `.on()`
 This method loads all the presets in the camera, enables the infrared, depth and RGB channels and starts the camera pipeline. 
@@ -56,7 +56,7 @@ This method loads all the presets in the camera, enables the infrared, depth and
 
 #### `.off()`  
 This method stops the camera pipeline. 
-> Call this method when you don't need the camera option anymore.
+> Call this method when you don't need the camera object anymore.
 
 #### `.get_all(save = False, align_to = rs.stream.color)`
 This method returns frame, image and depth intrinsics data. 
@@ -65,7 +65,7 @@ depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int = ca
 ```
 
 #### `.center(pxl, depth_frame, depth_int, r = 10, l = 20)`
-Returns the XYZ Cartesian coordinate of the pixel point `pxl`, given the depth frame and depth intrinsics data. If the XYZ data is not valid for `pxl`. Then the method searches over the pixels inside the circle with radius `r`  and centered around `pxl`, finds the first closest `l` pixels with valid XYZ and average over their XYZs to estimate the XYZ for `pxl`. 
+Returns the XYZ Cartesian coordinate of the pixel point `pxl`, given the depth frame and depth intrinsics data, in respect to the camera coordinate system. If the XYZ data is not valid for `pxl`. Then the method searches over the pixels inside the circle with radius `r`  and centered around `pxl`, finds the first closest `l` pixels with valid XYZ and average over their XYZs to estimate the XYZ for `pxl`. 
 
 #### `.length(pxl0, pxl1, depth_frame, depth_int, l =1000, start = 30)`
 Returns the euclidean distance between the two pixel points `pxl0` and `pxl1` in the real world, given the depth frame and depth intrinsic data.
