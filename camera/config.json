@@ -1,0 +1,11 @@
+{
+    "width": 1280,
+    "height": 720,
+    "fps": 15,
+    "stream": ["depth", "ir"],
+    "decimate_scale": 1,
+    "chess_pattern" : [9,6],
+    "time_out": 10,
+    "preset_path": "preset/d435i.json",
+    "image_save_path": "img/",
+}

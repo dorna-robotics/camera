@@ -138,11 +138,6 @@ class camera(helper):
         self.pipeline.stop()
 
 
-class dcamera(camera):
-    """docstring for dcamera"""
-    def __init__(self, arg):
-        super(dcamera, self).__init__(arg) 
-
     """
     get frame, image and depth intrinsics data
     """
@@ -157,55 +152,10 @@ class dcamera(camera):
         depth_int = rs.video_stream_profile(depth_frame.profile).get_intrinsics()        
         if save:
             try:
-                cv2.imwrite("img/"+str(int(time.time()))+".jpg", color_img) 
+                cv2.imwrite(self.arg["image_save_path"]+str(int(time.time()))+".jpg", color_img) 
             except:
                 pass
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int
-    
-    """
-    give two pixels
-    find the distance between them
-    notice that the depth data is usually not valid around  edges
-    We start from the two edges and find the distance between the two valid pixels on the line connecting the two edges.
-
-    """
-    def length(self, pxl0, pxl1, depth_frame, depth_int, l =1000, start = 30):
-        pxl0 = np.array(pxl0)
-        pxl1 = np.array(pxl1)
-
-        print("pxl0, pxl1: ", pxl0, pxl1)
-
-        xyz0 = np.array([0. for i in range(3)])
-        xyz1 = np.array([0. for i in range(3)])
-
-        # xyz0        
-        for t0 in range(start, l):   
-            p = pxl0 + t0/l * (pxl1 - pxl0)
-
-            xyz_t = self.xyz(p, depth_frame, depth_int)
-            if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
-                xyz0 = xyz_t
-                print("pixel0: ", p, t0, xyz0)
-                break 
-
-        # xyz0        
-        for t1 in range(start, l):   
-            p = pxl1 + t1/l * (pxl0 - pxl1)
-
-            xyz_t = self.xyz(p, depth_frame, depth_int)
-            if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
-                xyz1 = xyz_t
-                print("pixel1: ", p, t1, xyz1)
-                break 
-
-        distance = 0
-        try:
-            #distance = np.linalg.norm(xyz0 - xyz1) * l / (l-t0-t1)
-            distance = np.linalg.norm(xyz0[0:2] - xyz1[0:2]) * l / (l-t0-t1) 
-        except Exception as ex:
-            pass
-
-        return distance
 
     """
     give the center of a circle in pixel, and the radius, find the xyz
@@ -214,7 +164,7 @@ class dcamera(camera):
     l : max number of valid pixels to estimable xyz
     r: length in pixel
     """
-    def circle_center(self, pxl, depth_frame, depth_int, r = 10, l = 20):
+    def center(self, pxl, depth_frame, depth_int, r = 10, l = 20):
         dim = np.asanyarray(depth_frame.get_data()).shape        
         xyz = self.xyz(pxl, depth_frame, depth_int, (int(min(r*math.sqrt(2)/2, 5)),int(min(r*math.sqrt(2)/2, 5))))
 
@@ -277,15 +227,55 @@ class dcamera(camera):
                 xyz = np.matrix(pxl) * T + B
                 xyz = np.asarray(xyz).reshape(-1)
 
-        return xyz
+        return xyz 
 
-if __name__ == '__main__':
-    import json
-    
-    
+
+    """
+    give two pixels
+    find the distance between them
+    notice that the depth data is usually not valid around  edges
+    We start from the two edges and find the distance between the two valid pixels on the line connecting the two edges.
+
+    """
+    def length(self, pxl0, pxl1, depth_frame, depth_int, l =1000, start = 30):
+        pxl0 = np.array(pxl0)
+        pxl1 = np.array(pxl1)
+
+        xyz0 = np.array([0. for i in range(3)])
+        xyz1 = np.array([0. for i in range(3)])
+
+        # xyz0        
+        for t0 in range(start, l):   
+            p = pxl0 + t0/l * (pxl1 - pxl0)
+
+            xyz_t = self.xyz(p, depth_frame, depth_int)
+            if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
+                xyz0 = xyz_t
+                break 
+
+        # xyz0        
+        for t1 in range(start, l):   
+            p = pxl1 + t1/l * (pxl0 - pxl1)
+
+            xyz_t = self.xyz(p, depth_frame, depth_int)
+            if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
+                xyz1 = xyz_t
+                break 
+
+        distance = 0
+        try:
+            #distance = np.linalg.norm(xyz0 - xyz1) * l / (l-t0-t1)
+            distance = np.linalg.norm(xyz0[0:2] - xyz1[0:2]) * l / (l-t0-t1) 
+        except Exception as ex:
+            pass
+
+        return distance
+
+
+if __name__ == '__main__':    
     with open("config.json") as json_file:
         arg = json.load(json_file)
-    camera = dcamera(arg)
+    camera = camera(arg)
     camera.on()
 
     for i in range(4):

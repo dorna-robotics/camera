@@ -78,7 +78,7 @@ def find_circle(src):
     rows = gray.shape[0]
     circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, rows / 8,
                                param1=100, param2=30,
-                               minRadius=18, maxRadius=30)
+                               minRadius=10, maxRadius=100)
     
     
     circle = []
@@ -107,7 +107,8 @@ def distance(x,y):
     return math.sqrt(s)
 
 def follow_coin():
-    min_height = 570
+    # min_height = 570
+    min_height = 10
     min_distance = 60
     num_seg = 10
     T = np.matrix([[ 1.00362522e+00, -6.08170296e-03,  2.14515751e-02],
@@ -123,14 +124,15 @@ def follow_coin():
 
     # robot object and tool length is 60.58
     ip, port = "192.168.254.23", 443
-    robot = dorna()
-    robot.connect(ip, port)
+    #robot = dorna()
+    #robot.connect(ip, port)
 
     stop = False
     point_list = []
     step_list = []
     # get current robot xyz
-    sys = dict(robot.sys)
+    #sys = dict(robot.sys)
+    sys = {"x": 0, "y": 0, "z": 0}
     xyz_final = np.array([sys[x] for x in ["x", "y", "z"]])
     circle = False
     circle_prev = False
@@ -179,7 +181,7 @@ def follow_coin():
         i += 1
 
     camera.off()
-    robot.close()
+    #robot.close()
 
 
 def follow_coin_copy():
