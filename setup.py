@@ -8,7 +8,7 @@ setuptools.setup(
     version= "1.00",
     author="Dorna Robotics",
     author_email="info@dorna.ai",
-    description="Python API for intel RealSense camera and Dorna 2 robotic arm.",
+    description="Python API for Intel RealSense camera and Dorna 2 robotic arm.",
     long_description=readme,
     long_description_content_type='text/markdown',
     url="https://dorna.ai/",
