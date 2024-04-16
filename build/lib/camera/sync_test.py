@@ -113,7 +113,7 @@ def camera_robot_base_fixed(camera_object, robot_object):
         ret, corners = camera_object.chess_corner(color_img, (3, 3))
         corners = np.ravel(corners).reshape(-1,2)
         corners = corners.tolist() 
-        corner_index = [0, 2, 8, 6]
+        corner_index = [0,1, 2, 3, 4, 5, 6, 7, 8]
         if ret:
             # for each corner print xyz
             i = 0
@@ -204,7 +204,7 @@ if __name__ == '__main__':
     # robot object and tool length is 60.58
     ip, port = "192.168.254.23", 443
     robot = dorna()
-    robot.connect(ip, port)
+    #robot.connect(ip, port)
     #robot.play({"cmd":"toollength","id":10, "toollength":60.58})
     #robot.wait(id=10, stat=2)
 

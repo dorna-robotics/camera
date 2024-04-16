@@ -1,0 +1,11 @@
+{
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "stream": ["depth", "infrared", "color"],
+    "align": "color",
+    "decimate_scale": 1,
+    "chess_pattern" : [4,4],
+    "time_out": 10,
+    "preset_path": "preset/d405_default.json"
+}

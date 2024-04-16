@@ -278,7 +278,5 @@ def follow_coin_copy():
     camera.off()
     robot.close()
 
-
-
 if __name__ == '__main__':
     follow_coin()  

@@ -146,9 +146,23 @@ class Helper(object):
 
 class Camera(Helper):
     """docstring for ClassName"""
-    def __init__(self):
+    def __init__(self, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.4, 20], "hole_filling":1}, preset_path=None):
         super(Camera, self).__init__()
 
+        # assign preset if not exists
+        if not preset_path:
+            # Get the directory of the current module
+            module_dir = os.path.dirname(__file__)
+
+            # Construct the path to the JSON file
+            preset_path = os.path.join(module_dir, 'preset', 'd405.json')
+
+        # json string
+        self.preset = json.load(open(preset_path))
+        self.preset_string = json.dumps(self.preset)
+
+        # filter
+        self.filter = filter
 
     def camera_matrix(self, depth_int):
         ratio = 1
@@ -199,63 +213,20 @@ class Camera(Helper):
             color_frame, 
             frames)
 
-    def all_device(self):
-        # Create a context object
-        ctx = rs.context()
-
-        # Get a list of all connected devices
-        devices = ctx.query_devices()
-
-        return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
-
-
-    def connect(self, serial_number="", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.4, 20], "hole_filling":1}) :
-        # filter
-        self.filter = filter
-
+    def connect(self) :
         # Create a pipeline
         self.pipeline = rs.pipeline()
 
         #Create a config and configure the pipeline to stream
         config = rs.config()
-        
-        # serial number and name
-        all_device = self.all_device()
-        if serial_number:
-            config.enable_device(serial_number)
-            for device in all_device:
-                if device['serial_number'] == serial_number:
-                    name = device['name']
-                    break
-        else:
-            serial_number = all_device[0]["serial_number"]
-            name = all_device[0]["name"]
-        
-        config.enable_device(serial_number)
-
-        # preset
-        # assign preset if not exists
-        if not preset_path:
-            # Get the directory of the current module
-            module_dir = os.path.dirname(__file__)
-
-            # Construct the path to the JSON file
-            preset_path = os.path.join(module_dir, 'preset', name.replace(" ", "_")+".json")
-
-        # json string
-        self.preset = json.load(open(preset_path))
-        self.preset_string = json.dumps(self.preset)
-
-        # stream
         config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
         config.enable_stream(rs.stream.infrared,1,  int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
         config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
-        
         profile = self.pipeline.start(config)
 
         # apply advanced mode
-        device = profile.get_device()
-        self.advnc_mode = rs.rs400_advanced_mode(device)
+        dev = profile.get_device()
+        self.advnc_mode = rs.rs400_advanced_mode(dev)
         self.advnc_mode.load_json(self.preset_string)
 
         # decimate
@@ -294,17 +265,15 @@ class Camera(Helper):
         else:
             self.hole_filling = None
 
-        # global time and auto exposure
-        sensor_dep = device.first_depth_sensor()
-        #rs.option.global_time_enabled
-        sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
-        #sensor_dep.set_option(rs.option.enable_auto_exposure, 1) # auto expose
+        #decimate = rs.decimation_filter()
+        #decimate.set_option(rs.option.filter_magnitude, 2 ** decimate_scale)
+
+        # time
+        rs.option.global_time_enabled
+
 
     def close(self):
-        try:
-            self.pipeline.stop()
-        except:
-            pass
+        self.pipeline.stop()
 
 
     """
@@ -328,15 +297,12 @@ class Camera(Helper):
 if __name__ == '__main__':    
     camera = Camera()
     camera.connect()
-    
-    while True:
-        start = time.time()
+
+    while True:        
         depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, _, timestamp = camera.get_all()
-        print(time.time()-start)
         cv2.imshow("img",depth_img)
 
         xyz, sample = camera.xyz((720, 360), depth_frame, depth_int)
         if cv2.waitKey(1) == ord('q'):
-            break
-           
+            break           
     camera.close()

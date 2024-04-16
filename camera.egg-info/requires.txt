@@ -1,0 +1,4 @@
+setuptools
+numpy
+pyrealsense2
+opencv-python

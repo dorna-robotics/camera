@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="camera",
-    version= "1.00",
+    version= "1.0.2",
     author="Dorna Robotics",
     author_email="info@dorna.ai",
     description="Python API for Intel RealSense camera and Dorna 2 robotic arm.",
