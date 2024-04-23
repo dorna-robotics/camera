@@ -412,13 +412,36 @@ def main_motion():
 
     camera.motion_rec()
 
-    time.sleep(2)
+    time.sleep(10)
 
     accel, gyro = camera.motion_stop()
     camera.close()
 
-    print(accel, gyro)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Example list of points
+    points = gyro
+
+    # Extract x, y, z, and t from the points
+    x = [point[0] for point in points]
+    y = [point[1] for point in points]
+    z = [point[2] for point in points]
+    t = [point[3] for point in points]
+
+    # Calculate the norm of the vector [x, y, z] for each point
+    norms = [np.linalg.norm([x[i], y[i], z[i]]) for i in range(len(points))]
+
+    # Plot the norm against time
+    plt.plot(t, norms)
+    plt.xlabel('Time')
+    plt.ylabel('Norm of [x, y, z]')
+    plt.title('Norm of [x, y, z] vs. Time')
+    plt.grid(True)
+    plt.show()
+
 
 if __name__ == '__main__':    
-    main_rgbd()
-    #main_motion()
+    #main_rgbd()
+    main_motion()
