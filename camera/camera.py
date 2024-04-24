@@ -407,19 +407,18 @@ def main_rgbd():
 
 
 def main_motion():
+    import matplotlib.pyplot as plt
     camera = Camera()
     camera.connect(mode="motion")
 
     camera.motion_rec()
 
-    time.sleep(10)
+    print("start")
+    time.sleep(1.5)
 
     accel, gyro = camera.motion_stop()
+    print("end")
     camera.close()
-
-
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     # Example list of points
     points = gyro
@@ -431,16 +430,25 @@ def main_motion():
     t = [point[3] for point in points]
 
     # Calculate the norm of the vector [x, y, z] for each point
-    norms = [np.linalg.norm([x[i], y[i], z[i]]) for i in range(len(points))]
+    signal = [np.linalg.norm([x[i], y[i], z[i]]) for i in range(len(points))]
 
-    # Plot the norm against time
-    plt.plot(t, norms)
+    # Compute Fourier transformation
+    fourier_transform = np.fft.fft(signal)
+    frequencies = np.fft.fftfreq(len(signal), t[1] - t[0])  # Frequency values
+
+    plt.subplot(2, 1, 1)
+    plt.plot(t, signal, "-")
+    plt.title('Original Signal')
     plt.xlabel('Time')
-    plt.ylabel('Norm of [x, y, z]')
-    plt.title('Norm of [x, y, z] vs. Time')
-    plt.grid(True)
-    plt.show()
+    plt.ylabel('Amplitude')
 
+    plt.subplot(2, 1, 2)
+    plt.plot(frequencies, np.abs(fourier_transform), "-")
+    plt.title('Fourier Transformation')
+    plt.xlabel('Frequency')
+    plt.ylabel('Magnitude')
+
+    plt.show()
 
 if __name__ == '__main__':    
     #main_rgbd()
