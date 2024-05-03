@@ -5,6 +5,8 @@ import math
 import cv2
 import json
 import os
+import threading
+import queue
 """
 Euclidean dimension is in mm
 """
@@ -146,23 +148,9 @@ class Helper(object):
 
 class Camera(Helper):
     """docstring for ClassName"""
-    def __init__(self, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.4, 20], "hole_filling":1}, preset_path=None):
+    def __init__(self):
         super(Camera, self).__init__()
 
-        # assign preset if not exists
-        if not preset_path:
-            # Get the directory of the current module
-            module_dir = os.path.dirname(__file__)
-
-            # Construct the path to the JSON file
-            preset_path = os.path.join(module_dir, 'preset', 'd405.json')
-
-        # json string
-        self.preset = json.load(open(preset_path))
-        self.preset_string = json.dumps(self.preset)
-
-        # filter
-        self.filter = filter
 
     def camera_matrix(self, depth_int):
         ratio = 1
@@ -213,67 +201,117 @@ class Camera(Helper):
             color_frame, 
             frames)
 
-    def connect(self) :
+    def all_device(self):
+        # Create a context object
+        ctx = rs.context()
+
+        # Get a list of all connected devices
+        devices = ctx.query_devices()
+
+        return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
+
+
+    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.4, 20], "hole_filling":1}) :
+        # filter
+        self.filter = filter
+
         # Create a pipeline
         self.pipeline = rs.pipeline()
 
         #Create a config and configure the pipeline to stream
         config = rs.config()
-        config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
-        config.enable_stream(rs.stream.infrared,1,  int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
-        config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
-        profile = self.pipeline.start(config)
-
-        # apply advanced mode
-        dev = profile.get_device()
-        self.advnc_mode = rs.rs400_advanced_mode(dev)
-        self.advnc_mode.load_json(self.preset_string)
-
-        # decimate
-        if type(self.filter) == dict and "decimate" in self.filter and self.filter["decimate"] != None:
-            self.decimate = rs.decimation_filter()
-            self.decimate.set_option(rs.option.filter_magnitude, self.filter["decimate"])
-            # depth_to_disparity
-            self.depth_to_disparity = rs.disparity_transform(True)
-            self.disparity_to_depth = rs.disparity_transform(False)
-        else:
-            self.decimate = None
-            self.depth_to_disparity = None
-            self.disparity_to_depth = None
-
-        # spatial
-        if type(self.filter) == dict and "spatial" in self.filter and self.filter["spatial"] != None:
-            self.spatial = rs.spatial_filter()
-            self.spatial.set_option(rs.option.filter_magnitude, self.filter["spatial"][0])
-            self.spatial.set_option(rs.option.filter_smooth_alpha, self.filter["spatial"][1])
-            self.spatial.set_option(rs.option.filter_smooth_delta, self.filter["spatial"][2])
-        else:
-            self.spatial = None
         
-        # temporal
-        if type(self.filter) == dict and "temporal" in self.filter and self.filter["temporal"] != None: 
-            self.temporal = rs.temporal_filter()
-            self.temporal.set_option(rs.option.filter_smooth_alpha, self.filter["temporal"][0])
-            self.temporal.set_option(rs.option.filter_smooth_delta, self.filter["temporal"][1])
+        # serial number and name
+        all_device = self.all_device()
+        if serial_number:
+            config.enable_device(serial_number)
+            for device in all_device:
+                if device['serial_number'] == serial_number:
+                    name = device['name']
+                    break
         else:
-            self.temporal = None
+            serial_number = all_device[0]["serial_number"]
+            name = all_device[0]["name"]
+        
+        config.enable_device(serial_number)
 
-        # hole_filling
-        if type(self.filter) == dict and "hole_filling" in self.filter and self.filter["hole_filling"] != None:
-            self.hole_filling = rs.hole_filling_filter()
-            self.hole_filling.set_option(rs.option.holes_fill, self.filter["hole_filling"])
+        # preset
+        # assign preset if not exists
+        if not preset_path:
+            # Get the directory of the current module
+            module_dir = os.path.dirname(__file__)
+
+            # Construct the path to the JSON file
+            preset_path = os.path.join(module_dir, 'preset', name.replace(" ", "_")+".json")
+
+        # json string
+        self.preset = json.load(open(preset_path))
+        self.preset_string = json.dumps(self.preset)
+
+        # stream
+        if mode == "motion":
+            config.enable_stream(rs.stream.accel)
+            config.enable_stream(rs.stream.gyro)
+            profile = self.pipeline.start(config)
         else:
-            self.hole_filling = None
+            config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
+            config.enable_stream(rs.stream.infrared,1,  int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
+            config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
 
-        #decimate = rs.decimation_filter()
-        #decimate.set_option(rs.option.filter_magnitude, 2 ** decimate_scale)
+            profile = self.pipeline.start(config)
 
-        # time
-        rs.option.global_time_enabled
+            # apply advanced mode
+            device = profile.get_device()
+            self.advnc_mode = rs.rs400_advanced_mode(device)
+            self.advnc_mode.load_json(self.preset_string)
 
+            # decimate
+            if type(self.filter) == dict and "decimate" in self.filter and self.filter["decimate"] != None:
+                self.decimate = rs.decimation_filter()
+                self.decimate.set_option(rs.option.filter_magnitude, self.filter["decimate"])
+                # depth_to_disparity
+                self.depth_to_disparity = rs.disparity_transform(True)
+                self.disparity_to_depth = rs.disparity_transform(False)
+            else:
+                self.decimate = None
+                self.depth_to_disparity = None
+                self.disparity_to_depth = None
+
+            # spatial
+            if type(self.filter) == dict and "spatial" in self.filter and self.filter["spatial"] != None:
+                self.spatial = rs.spatial_filter()
+                self.spatial.set_option(rs.option.filter_magnitude, self.filter["spatial"][0])
+                self.spatial.set_option(rs.option.filter_smooth_alpha, self.filter["spatial"][1])
+                self.spatial.set_option(rs.option.filter_smooth_delta, self.filter["spatial"][2])
+            else:
+                self.spatial = None
+            
+            # temporal
+            if type(self.filter) == dict and "temporal" in self.filter and self.filter["temporal"] != None: 
+                self.temporal = rs.temporal_filter()
+                self.temporal.set_option(rs.option.filter_smooth_alpha, self.filter["temporal"][0])
+                self.temporal.set_option(rs.option.filter_smooth_delta, self.filter["temporal"][1])
+            else:
+                self.temporal = None
+
+            # hole_filling
+            if type(self.filter) == dict and "hole_filling" in self.filter and self.filter["hole_filling"] != None:
+                self.hole_filling = rs.hole_filling_filter()
+                self.hole_filling.set_option(rs.option.holes_fill, self.filter["hole_filling"])
+            else:
+                self.hole_filling = None
+
+            # global time and auto exposure
+            sensor_dep = device.first_depth_sensor()
+            #rs.option.global_time_enabled
+            sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
+            #sensor_dep.set_option(rs.option.enable_auto_exposure, 1) # auto expose
 
     def close(self):
-        self.pipeline.stop()
+        try:
+            self.pipeline.stop()
+        except:
+            pass
 
 
     """
@@ -294,15 +332,124 @@ class Camera(Helper):
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, frames.get_timestamp()/1000
 
 
-if __name__ == '__main__':    
+    def motion_thread_func(self):
+        while self.motion_rec_start:
+            # Wait for the next set of frames
+            frames = self.pipeline.wait_for_frames()
+            try:
+                # grab data
+                t = time.time()
+                accel = frames[0].as_motion_frame().get_motion_data()
+                gyro = frames[1].as_motion_frame().get_motion_data()
+
+                # add data
+                self.motion_queue.put([[accel.x, accel.y, accel.z, t], [gyro.x, gyro.y, gyro.z, t]])
+            except Exception as ex:
+                pass
+            time.sleep(0.001)
+
+
+    def motion_rec(self):
+        # fresh start
+        self.motion_stop()
+
+        # new motion queue
+        self.motion_queue = queue.Queue()
+
+        # start the loop
+        self.motion_rec_start = True
+
+        # start the thread
+        self.motion_thread = threading.Thread(target=self.motion_thread_func)
+        self.motion_thread.start()
+    
+    def motion_stop(self):
+        # init gyro and accel
+        accel = []
+        gyro = []
+
+        # close the loop
+        self.motion_rec_start = False
+
+        #close the thread
+        try:
+            self.motion_thread.join()
+        except Exception as ex:
+            pass
+
+        # get all the data
+        try:
+            while not self.motion_queue.empty():
+                data = self.motion_queue.get()
+                accel.append(data[0])
+                gyro.append(data[1])
+        except:
+            pass
+
+        return accel, gyro
+
+
+def main_rgbd():
     camera = Camera()
     camera.connect()
-
-    while True:        
+    
+    while True:
+        start = time.time()
         depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, _, timestamp = camera.get_all()
+        print(time.time()-start)
         cv2.imshow("img",depth_img)
 
         xyz, sample = camera.xyz((720, 360), depth_frame, depth_int)
         if cv2.waitKey(1) == ord('q'):
-            break           
+            break
+           
     camera.close()
+
+
+def main_motion():
+    import matplotlib.pyplot as plt
+    camera = Camera()
+    camera.connect(mode="motion")
+
+    camera.motion_rec()
+
+    print("start")
+    time.sleep(1.5)
+
+    accel, gyro = camera.motion_stop()
+    print("end")
+    camera.close()
+
+    # Example list of points
+    points = gyro
+
+    # Extract x, y, z, and t from the points
+    x = [point[0] for point in points]
+    y = [point[1] for point in points]
+    z = [point[2] for point in points]
+    t = [point[3] for point in points]
+
+    # Calculate the norm of the vector [x, y, z] for each point
+    signal = [np.linalg.norm([x[i], y[i], z[i]]) for i in range(len(points))]
+
+    # Compute Fourier transformation
+    fourier_transform = np.fft.fft(signal)
+    frequencies = np.fft.fftfreq(len(signal), t[1] - t[0])  # Frequency values
+
+    plt.subplot(2, 1, 1)
+    plt.plot(t, signal, "-")
+    plt.title('Original Signal')
+    plt.xlabel('Time')
+    plt.ylabel('Amplitude')
+
+    plt.subplot(2, 1, 2)
+    plt.plot(frequencies, np.abs(fourier_transform), "-")
+    plt.title('Fourier Transformation')
+    plt.xlabel('Frequency')
+    plt.ylabel('Magnitude')
+
+    plt.show()
+
+if __name__ == '__main__':    
+    #main_rgbd()
+    main_motion()

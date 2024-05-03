@@ -11,7 +11,8 @@ camera.egg-info/not-zip-safe
 camera.egg-info/requires.txt
 camera.egg-info/top_level.txt
 camera/preset/EdgeMapD435.json
-camera/preset/d405.json
+camera/preset/Intel_RealSense_D405.json
+camera/preset/Intel_RealSense_D455.json
 camera/preset/d415.json
 camera/preset/d435i.json
 camera/preset/d435i_close.json
