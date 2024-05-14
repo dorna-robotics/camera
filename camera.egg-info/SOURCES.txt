@@ -2,7 +2,6 @@ MANIFEST.in
 README.md
 setup.py
 camera/__init__.py
-camera/board.py
 camera/camera.py
 camera.egg-info/PKG-INFO
 camera.egg-info/SOURCES.txt
@@ -13,6 +12,7 @@ camera.egg-info/top_level.txt
 camera/preset/EdgeMapD435.json
 camera/preset/Intel_RealSense_D405.json
 camera/preset/Intel_RealSense_D455.json
+camera/preset/Intel_RealSense_D456.json
 camera/preset/d415.json
 camera/preset/d435i.json
 camera/preset/d435i_close.json

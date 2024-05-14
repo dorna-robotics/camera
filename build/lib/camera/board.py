@@ -99,4 +99,4 @@ def main_aruco():
 		cv2.imwrite("arc_"+str(i)+".png", img)
 
 if __name__ == '__main__':
-	main_charuco()
+	main_aruco()

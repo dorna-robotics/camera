@@ -211,7 +211,7 @@ class Camera(Helper):
         return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
 
 
-    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.4, 20], "hole_filling":1}) :
+    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
         # filter
         self.filter = filter
 
