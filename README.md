@@ -70,7 +70,7 @@ Connects to a RealSense device and configures the pipeline.
   - `serial_number` (default=""): Serial number of the device to connect to.
   - `mode` (default="rgbd"): Mode of the camera, either `"rgbd"` or `"motion"` (used to capture the gyro data).
   - `preset_path` (default=None): Path to the preset configuration file.
-  - `filter` (default={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}): Dictionary of filter settings. Apply post-processing filter to the depth data. For more information check [this link](https://dev.intelrealsense.com/docs/post-processing-filters)
+  - `filter` (default={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}): Dictionary of filter settings. Apply post-processing filter to the depth data (for more information check [this link](https://dev.intelrealsense.com/docs/post-processing-filters)).
 
 - **Returns:** `True` if the connection is successful.
 
@@ -78,7 +78,8 @@ Connects to a RealSense device and configures the pipeline.
 Stops the camera pipeline.
 
 - **Returns:** `True` if the pipeline is stopped successfully.
-> 🚨 **Notice:** It is necessary to always close the camera connection once your application is over. 
+> 🚨 **Notice:** It is necessary to always close the camera connection once your application is over.  
+
 > 🚨 **Notice:** Multiple users can't access the camera at the same time (multiple connection is not supported).
 
 
