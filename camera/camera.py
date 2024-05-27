@@ -126,7 +126,7 @@ class Helper(object):
         pxl = np.array(pxl).astype(int)
 
         # lattice
-        lattice = np.array([[x,y] for x in range(np.floor(-wnd[0]/2), np.floor(wnd[0]/2)+1) for y in range(np.floor(-wnd[1]/2), np.floor(wnd[1]/2)+1)])
+        lattice = np.array([[x,y] for x in range(int(np.floor(-wnd[0]/2)), int(np.floor(wnd[0]/2))+1) for y in range(int(np.floor(-wnd[1]/2)), int(np.floor(wnd[1]/2))+1)])
         for l in lattice:
             try:
                 pxl_new = pxl + l 

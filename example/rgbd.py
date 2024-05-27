@@ -18,7 +18,7 @@ while True:
     #cv2.imshow("color_img", color_img)
 
     # get xyz in camera frame of the center pixel in the image
-    height, width = depth_img.shape
+    height, width, _ = depth_img.shape
     xyz, sample = camera.xyz((width/2, height/2), depth_frame, depth_int)
     print("xyz: ", xyz)
     
