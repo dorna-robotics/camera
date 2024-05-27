@@ -473,22 +473,6 @@ class Camera(Helper):
         return accel, gyro
 
 
-def main_rgbd():
-    camera = Camera()
-    camera.connect(filter={})
-    
-    while True:
-        depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, _, timestamp = camera.get_all()
-        cv2.imshow("img",depth_img)
-
-        xyz, sample = camera.xyz((640, 360), depth_frame, depth_int)
-        if cv2.waitKey(1) == ord('q'):
-            break
-
-    print(xyz)    
-    camera.close()
-
-
 def main_motion():
     import matplotlib.pyplot as plt
     camera = Camera()
