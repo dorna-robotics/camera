@@ -2,7 +2,6 @@ include README.md
 include setup.py
 include LICENSE
 
-recursive-include camera/img *
 recursive-include camera/preset *
 include camera/*.py
 include camera/*.json
