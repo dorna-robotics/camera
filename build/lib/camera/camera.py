@@ -110,7 +110,7 @@ class Helper(object):
         for t0 in range(start, l):   
             p = pxl0 + t0/l * (pxl1 - pxl0)
 
-            xyz_t = self.xyz(p, depth_frame, depth_int)
+            xyz_t,_ = self.xyz(p, depth_frame, depth_int)
             if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
                 xyz0 = xyz_t
                 break 
@@ -119,14 +119,13 @@ class Helper(object):
         for t1 in range(start, l):   
             p = pxl1 + t1/l * (pxl0 - pxl1)
 
-            xyz_t = self.xyz(p, depth_frame, depth_int)
+            xyz_t,_ = self.xyz(p, depth_frame, depth_int)
             if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
                 xyz1 = xyz_t
                 break 
 
         distance = 0
         try:
-            #distance = np.linalg.norm(xyz0 - xyz1) * l / (l-t0-t1)
             distance = np.linalg.norm(xyz0[0:2] - xyz1[0:2]) * l / (l-t0-t1) 
         except Exception as ex:
             pass
@@ -152,20 +151,20 @@ class Camera(Helper):
         super(Camera, self).__init__()
 
 
-    def camera_matrix(self, depth_int):
-        ratio = 1
-        if type(self.filter) == dict and "decimate" in self.filter:
+    def camera_matrix(self, depth_int, ratio=1):
+        if ratio is None and type(self.filter) == dict and "decimate" in self.filter:
             ratio = self.filter["decimate"]
 
         return np.array([[ratio*depth_int.fx,   0.        , ratio*depth_int.ppx],
                                 [  0.        , ratio*depth_int.fy, ratio*depth_int.ppy],
                                 [  0.        ,   0.        ,   1.        ]])
 
+
     def dist_coeffs(self, depth_int):
         return np.array(depth_int.coeffs)
 
 
-    def frame(self, align_to=rs.stream.color, time_out=10):
+    def frame(self, align_to, time_out=10):
         # Get frameset of ir and depth
         frames = self.pipeline.wait_for_frames(1000 * time_out)
 
@@ -176,9 +175,9 @@ class Camera(Helper):
         aligned_frames = align.process(frames)
         
         # frames
-        depth_frame = frames.get_depth_frame()
-        ir_frame = frames.get_infrared_frame()
-        color_frame = frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        ir_frame = aligned_frames.get_infrared_frame()
+        color_frame = aligned_frames.get_color_frame()
         # filters
         if self.decimate:
             depth_frame = self.decimate.process(depth_frame)
@@ -194,12 +193,9 @@ class Camera(Helper):
             depth_frame = self.hole_filling.process(depth_frame)
 
         depth_frame = depth_frame.as_depth_frame()
+        
         # Get aligned frames
-        return (
-            depth_frame,
-            ir_frame,
-            color_frame, 
-            frames)
+        return depth_frame, ir_frame, color_frame, frames
 
     def all_device(self):
         # Create a context object
@@ -211,7 +207,7 @@ class Camera(Helper):
         return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
 
 
-    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
+    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
         # filter
         self.filter = filter
 
@@ -255,7 +251,7 @@ class Camera(Helper):
             profile = self.pipeline.start(config)
         else:
             config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
-            config.enable_stream(rs.stream.infrared,1,  int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
+            config.enable_stream(rs.stream.infrared, 1, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
             config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
 
             profile = self.pipeline.start(config)
@@ -307,27 +303,28 @@ class Camera(Helper):
             sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
             #sensor_dep.set_option(rs.option.enable_auto_exposure, 1) # auto expose
 
+            return True
+
     def close(self):
         try:
             self.pipeline.stop()
         except:
             pass
+        return True
 
 
     """
     get frame, image and depth intrinsic data
     """
-    def get_all(self, align_to="color", alpha=0.03):
+    def get_all(self, align_to=rs.stream.color, alpha=0.03):
         # Create an align object
-        align_to = getattr(rs.stream, align_to)        
         depth_frame, ir_frame, color_frame, frames = self.frame(align_to)
 
         depth_img = np.asanyarray(depth_frame.get_data())
         depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
         ir_img = np.asanyarray(ir_frame.get_data())
         color_img = np.asanyarray(color_frame.get_data())
-
-        depth_int = rs.video_stream_profile(depth_frame.profile).get_intrinsics()
+        depth_int = rs.video_stream_profile(color_frame.profile).get_intrinsics()
 
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, frames.get_timestamp()/1000
 
@@ -391,18 +388,16 @@ class Camera(Helper):
 
 def main_rgbd():
     camera = Camera()
-    camera.connect()
+    camera.connect(filter={})
     
     while True:
-        start = time.time()
         depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, _, timestamp = camera.get_all()
-        print(time.time()-start)
-        cv2.imshow("img",depth_img)
+        cv2.imshow("img",color_img)
 
         xyz, sample = camera.xyz((720, 360), depth_frame, depth_int)
         if cv2.waitKey(1) == ord('q'):
             break
-           
+    
     camera.close()
 
 
@@ -451,5 +446,5 @@ def main_motion():
     plt.show()
 
 if __name__ == '__main__':    
-    #main_rgbd()
-    main_motion()
+    main_rgbd()
+    #main_motion()

@@ -1,11 +1,16 @@
 import setuptools
+import camera as pkg
+
+# Read the version from the dorna_vision package
+version = pkg.__version__
+
 
 with open("README.md", "r") as fh:
     readme = fh.read()
 
 setuptools.setup(
     name="camera",
-    version= "1.0.2",
+    version= version,
     author="Dorna Robotics",
     author_email="info@dorna.ai",
     description="Python API for Intel RealSense camera and Dorna 2 robotic arm.",
@@ -21,12 +26,6 @@ setuptools.setup(
         'Programming Language :: Python :: 3.7',
         "Operating System :: OS Independent",
         'Topic :: Software Development :: Libraries :: Python Modules',
-    ],
-    install_requires=[
-        "setuptools",
-        "numpy",
-        "pyrealsense2",
-        "opencv-python"
     ],
     license="MIT",
     include_package_data=True,

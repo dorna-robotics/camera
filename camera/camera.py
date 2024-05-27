@@ -19,18 +19,105 @@ class Helper(object):
         self.filter = None
 
     """
+    find the xyz of a given pixel with respect to a frame known to the user
+    method: bilinear, plane, idw
+    """
+    def xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane"):
+        # init
+        xyz = np.array([0. for i in range(3)])
+        
+        if method == "plane":
+            # adjust the inputs
+            pxl_ref = np.array(pxl_ref)
+            xyz_ref = np.array(xyz_ref)
+
+            # Calculate the centroid of the points
+            centroid = np.mean(xyz_ref, axis=0)
+
+            # Subtract the centroid from the points
+            centered_xyz_ref = xyz_ref - centroid
+
+            # Compute the SVD
+            _, _, vh = np.linalg.svd(centered_xyz_ref)
+
+            # The normal of the plane is the last row of vh
+            normal = vh[-1, :]
+
+            # The plane equation is normal[0] * (x - cx) + normal[1] * (y - cy) + normal[2] * (z - cz) = 0
+            # Rearrange to normal[0] * x + normal[1] * y + normal[2] * z = d
+            d = -normal.dot(centroid)
+
+            # Find the transformation from 2D pixel to 3D coordinates
+            # This typically requires camera intrinsics (camera matrix)
+            # Here we assume a direct linear relationship for simplicity
+            # Use the known points to establish the relationship
+
+            # Example: linear relationship (this is a simplification)
+            # For accurate transformation, use camera calibration techniques
+            A = np.hstack([pxl_ref, np.ones((pxl_ref.shape[0], 1))])
+            B = xyz_ref
+            coeff, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+
+            # Apply the transformation to the new pixel
+            new_pixel_homogeneous = np.array([pxl[0], pxl[1], 1])
+            estimated_xyz = new_pixel_homogeneous.dot(coeff)
+
+            # Use the plane equation to adjust the estimated z-coordinate
+            # Plane equation: normal[0]*x + normal[1]*y + normal[2]*z + d = 0
+            # Solve for z: z = -(normal[0]*x + normal[1]*y + d) / normal[2]
+            estimated_xyz[2] = -(normal[0]*estimated_xyz[0] + normal[1]*estimated_xyz[1] + d) / normal[2]
+            xyz = np.array(estimated_xyz)
+
+        elif method == "idw":
+            # Initialize sums for weights and weighted coordinates
+            weight_sum = 0
+            weighted_x_sum = 0
+            weighted_y_sum = 0
+            weighted_z_sum = 0
+
+            # Small value to prevent division by zero
+            epsilon = 1e-6
+
+            # Calculate weights and weighted sums
+            for (u, v), (x, y, z) in zip(pxl_ref, xyz_ref):
+                distance = np.sqrt((u - pxl[0])**2 + (v - pxl[1])**2)
+                if distance < epsilon:
+                    # If the random pixel is exactly at a known point, return its coordinates
+                    xyz = np.array([x, y, z])
+                    break
+                weight = 1 / (distance**power + epsilon)
+                weight_sum += weight
+                weighted_x_sum += x * weight
+                weighted_y_sum += y * weight
+                weighted_z_sum += z * weight
+
+            # Compute the estimated coordinates using weighted averages
+            xyz = np.array([weighted_x_sum / weight_sum,
+                            weighted_y_sum / weight_sum,
+                            weighted_z_sum / weight_sum,
+                ])
+
+        return xyz
+
+
+    """
     convert camera pixel to xyz
     Use linear model to estimate the center of the
-    linear model: xyz = T*pixel + B => change it to a overdetermined model Ax = b and find x ()
+    linear model: xyz = T*pixel + B => change it to a over determined model Ax = b and find x ()
     wnd : the window size of the pixels
     """
-    def xyz(self, pxl, depth_frame, depth_int, wnd = (0,0), z_min = 10, z_max = 2000): 
+    def xyz(self, pxl, depth_frame, depth_int, wnd = (0,0), z_gt=(10, 2000)): 
         if type(self.filter) == dict and "decimate" in self.filter:
             pxl = [x/self.filter["decimate"] for x in pxl]
 
         sample_pxl = []
         sample_xyz = []
         xyz = np.array([0. for i in range(3)])
+
+        # ground truth is given
+        if z_gt[0] == z_gt[1]:
+            xyz = z_gt[0]*np.array([(pxl[0]-depth_int.ppx)/depth_int.fx, (pxl[1]-depth_int.ppy)/depth_int.fy, 1]) 
+            return xyz, [v for v in zip(sample_pxl, sample_xyz)]
 
         # number of row and column
         dim = np.asanyarray(depth_frame.get_data()).shape
@@ -52,7 +139,7 @@ class Helper(object):
                 xyz_new = rs.rs2_deproject_pixel_to_point(depth_int, pxl_new.tolist(), depth_frame.get_distance(pxl_new[0], pxl_new[1]))
                 xyz_new  = 1000 * np.array(xyz_new) # in mm  
 
-                if xyz_new[2] > z_max or xyz_new[2] < z_min:
+                if xyz_new[2] > z_gt[1] or xyz_new[2] < z_gt[0]:
                     continue
 
                 sample_pxl.append(pxl_new)
@@ -110,7 +197,7 @@ class Helper(object):
         for t0 in range(start, l):   
             p = pxl0 + t0/l * (pxl1 - pxl0)
 
-            xyz_t = self.xyz(p, depth_frame, depth_int)
+            xyz_t,_ = self.xyz(p, depth_frame, depth_int)
             if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
                 xyz0 = xyz_t
                 break 
@@ -119,14 +206,13 @@ class Helper(object):
         for t1 in range(start, l):   
             p = pxl1 + t1/l * (pxl0 - pxl1)
 
-            xyz_t = self.xyz(p, depth_frame, depth_int)
+            xyz_t,_ = self.xyz(p, depth_frame, depth_int)
             if sum(xyz_t == [0, 0, 0]) < len(xyz_t):
                 xyz1 = xyz_t
                 break 
 
         distance = 0
         try:
-            #distance = np.linalg.norm(xyz0 - xyz1) * l / (l-t0-t1)
             distance = np.linalg.norm(xyz0[0:2] - xyz1[0:2]) * l / (l-t0-t1) 
         except Exception as ex:
             pass
@@ -152,20 +238,20 @@ class Camera(Helper):
         super(Camera, self).__init__()
 
 
-    def camera_matrix(self, depth_int):
-        ratio = 1
-        if type(self.filter) == dict and "decimate" in self.filter:
+    def camera_matrix(self, depth_int, ratio=1):
+        if ratio is None and type(self.filter) == dict and "decimate" in self.filter:
             ratio = self.filter["decimate"]
 
         return np.array([[ratio*depth_int.fx,   0.        , ratio*depth_int.ppx],
                                 [  0.        , ratio*depth_int.fy, ratio*depth_int.ppy],
                                 [  0.        ,   0.        ,   1.        ]])
 
+
     def dist_coeffs(self, depth_int):
         return np.array(depth_int.coeffs)
 
 
-    def frame(self, align_to=rs.stream.color, time_out=10):
+    def frame(self, align_to, time_out=10):
         # Get frameset of ir and depth
         frames = self.pipeline.wait_for_frames(1000 * time_out)
 
@@ -176,9 +262,9 @@ class Camera(Helper):
         aligned_frames = align.process(frames)
         
         # frames
-        depth_frame = frames.get_depth_frame()
-        ir_frame = frames.get_infrared_frame()
-        color_frame = frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        ir_frame = aligned_frames.get_infrared_frame()
+        color_frame = aligned_frames.get_color_frame()
         # filters
         if self.decimate:
             depth_frame = self.decimate.process(depth_frame)
@@ -194,12 +280,9 @@ class Camera(Helper):
             depth_frame = self.hole_filling.process(depth_frame)
 
         depth_frame = depth_frame.as_depth_frame()
+        
         # Get aligned frames
-        return (
-            depth_frame,
-            ir_frame,
-            color_frame, 
-            frames)
+        return depth_frame, ir_frame, color_frame, frames
 
     def all_device(self):
         # Create a context object
@@ -211,7 +294,7 @@ class Camera(Helper):
         return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
 
 
-    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"decimate":2, "spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
+    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
         # filter
         self.filter = filter
 
@@ -255,7 +338,7 @@ class Camera(Helper):
             profile = self.pipeline.start(config)
         else:
             config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
-            config.enable_stream(rs.stream.infrared,1,  int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
+            config.enable_stream(rs.stream.infrared, 1, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
             config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
 
             profile = self.pipeline.start(config)
@@ -307,27 +390,28 @@ class Camera(Helper):
             sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
             #sensor_dep.set_option(rs.option.enable_auto_exposure, 1) # auto expose
 
+            return True
+
     def close(self):
         try:
             self.pipeline.stop()
         except:
             pass
+        return True
 
 
     """
     get frame, image and depth intrinsic data
     """
-    def get_all(self, align_to="color", alpha=0.03):
+    def get_all(self, align_to=rs.stream.color, alpha=0.03):
         # Create an align object
-        align_to = getattr(rs.stream, align_to)        
         depth_frame, ir_frame, color_frame, frames = self.frame(align_to)
 
         depth_img = np.asanyarray(depth_frame.get_data())
         depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
         ir_img = np.asanyarray(ir_frame.get_data())
         color_img = np.asanyarray(color_frame.get_data())
-
-        depth_int = rs.video_stream_profile(depth_frame.profile).get_intrinsics()
+        depth_int = rs.video_stream_profile(color_frame.profile).get_intrinsics()
 
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, frames.get_timestamp()/1000
 
@@ -391,18 +475,17 @@ class Camera(Helper):
 
 def main_rgbd():
     camera = Camera()
-    camera.connect()
+    camera.connect(filter={})
     
     while True:
-        start = time.time()
         depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, _, timestamp = camera.get_all()
-        print(time.time()-start)
         cv2.imshow("img",depth_img)
 
-        xyz, sample = camera.xyz((720, 360), depth_frame, depth_int)
+        xyz, sample = camera.xyz((640, 360), depth_frame, depth_int)
         if cv2.waitKey(1) == ord('q'):
             break
-           
+
+    print(xyz)    
     camera.close()
 
 
@@ -451,5 +534,5 @@ def main_motion():
     plt.show()
 
 if __name__ == '__main__':    
-    #main_rgbd()
-    main_motion()
+    main_rgbd()
+    #main_motion()

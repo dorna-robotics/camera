@@ -4,18 +4,21 @@ This is the Python API repository that provides helper methods to use [D4XX Inte
 
 ## Installation
 Notice that the program has been tested only on Python 3.7+.
-
-### Download
-First, use `git clone` to download the repository:  
+- Download and install the [Intel® RealSense™ SDK 2.0](https://www.intelrealsense.com/sdk-2/) on the host computer.
+- Use `git clone` to download the `camera` repository:  
 ```bash
 git clone https://github.com/dorna-robotics/camera.git
 ```
-Or simply download the [zip file](https://github.com/dorna-robotics/camera/archive/master.zip), and uncompress the file.  
+Or simply download the [zip file](https://github.com/dorna-robotics/camera/archive/master.zip), and unzip the file.  
 
-### Install
-Next, go to the downloaded directory, where the `setup.py` file is located, and run:
+Go to the downloaded directory, where the `requirements.txt` file is located, and run:
 ```bash
-python setup.py install --force
+# install requirements
+pip install -r requirements.txt
+
+# install the main module
+cd ..
+pip install --upgrade --force-reinstall camera/
 ```
 
 ## Depth camera
@@ -59,7 +62,7 @@ This method stops the camera pipeline.
 > Call this method when you don't need the camera object anymore.
 
 #### `.get_all(save = False, align_to = rs.stream.color)`
-This method returns frame, image and depth intrinsics data. 
+This method returns frame, image and depth intrinsic data. 
 ```python
 depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int = camera.get_all()
 ```
