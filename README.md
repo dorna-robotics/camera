@@ -8,7 +8,7 @@ Notice that the program has been tested only on Python 3.7+.
 ### 1- RealSense SDK
 Download and install the [Intel® RealSense™ SDK 2.0](https://www.intelrealsense.com/sdk-2/) on the host computer.
 
-### 2- Install camera library
+### 2- Build the library
 Use `git clone` to download the `camera` repository, or simply download the [zip file](https://github.com/dorna-robotics/camera/archive/master.zip), and unzip the file.  
 ```bash
 git clone https://github.com/dorna-robotics/camera.git
