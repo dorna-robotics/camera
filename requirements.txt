@@ -1,4 +1,4 @@
 setuptools
 numpy
-opencv-python
+opencv-contrib-python
 pyrealsense2
