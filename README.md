@@ -1,5 +1,5 @@
 # Camera 
-This is the Python API repository that provides helper methods to use [D4XX Intel® RealSense™][realsense] camera. The API relies on [pyrealsense2][pyrealsense] library to get both RGB and depth frame data. In addition to that, the API offers methods to sync your RealSense camera with [Dorna 2 Robotic arm][dorna].
+This is the Python API repository that provides helper methods to use [D4XX Intel® RealSense™][realsense] camera. The API relies on [pyrealsense2][pyrealsense] library to get both RGB and depth frame data. In addition to that, the API offers methods to sync your RealSense camera with [Dorna robots][dorna].
 
 
 ## Installation
