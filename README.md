@@ -63,7 +63,7 @@ camera.close()
 ## Methods
 The `Camera` class is used to interface with a RealSense camera, providing methods for connecting to the camera, capturing frames, applying filters, and performing various operations on the captured data.
 
-### `connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1})`
+#### `connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1})`
 Connects to a RealSense device and configures the pipeline.
 
 - **Parameters:**
@@ -74,7 +74,7 @@ Connects to a RealSense device and configures the pipeline.
 
 - **Returns:** `True` if the connection is successful.
 
-### `close(self)`
+#### `close(self)`
 Stops the camera pipeline.
 
 - **Returns:** `True` if the pipeline is stopped successfully.
@@ -83,12 +83,12 @@ Stops the camera pipeline.
 > 🚨 **Notice:** Multiple users can't access the camera at the same time (multiple connection is not supported).
 
 
-### `all_device(self)`
+#### `all_device(self)`
 Lists all connected RealSense devices.
 
 - **Returns:** List of dictionaries containing device information (`name` and `serial_number`).
 
-### `get_all(self, align_to=rs.stream.color)`
+#### `get_all(self, align_to=rs.stream.color)`
 Captures all frames and images.
 
 - **Parameters:**
@@ -97,7 +97,7 @@ Captures all frames and images.
 - **Returns:** Tuple containing `depth_frame`, `ir_frame`, `color_frame`, `depth_img`, `ir_img`, `color_img`, `depth_int`, `frames`, and `timestamp`.
 
 
-### `camera_matrix(self, depth_int, ratio=1)`
+#### `camera_matrix(self, depth_int, ratio=1)`
 Returns the camera matrix based on the provided depth intrinsic.
 
 - **Parameters:**
@@ -106,7 +106,7 @@ Returns the camera matrix based on the provided depth intrinsic.
 
 - **Returns:** `np.array` representing the camera matrix.
 
-### `xyz(self, pixel, depth_frame, depth_intrinsics)`
+#### `xyz(self, pixel, depth_frame, depth_intrinsics)`
 Calculates the real-world 3D coordinates from the pixel coordinates and depth frame, in camera coordinate system.
 
 - **Parameters:**
@@ -116,7 +116,7 @@ Calculates the real-world 3D coordinates from the pixel coordinates and depth fr
 
 - **Returns:** A tuple containing the 3D coordinates `(x, y, z)` in millimeter (`mm`) and the depth value at the given pixel.
 
-### `dist_coeffs(self, depth_int)`
+#### `dist_coeffs(self, depth_int)`
 Returns the distortion coefficients of the camera.
 
 - **Parameters:**
@@ -124,14 +124,16 @@ Returns the distortion coefficients of the camera.
 
 - **Returns:** `np.array` containing the distortion coefficients.
 
-### `motion_rec(self)`
+#### `motion_rec(self)`
 > 🚨 **Notice:** Only available on certain models that supports gyro data.
+
 > 🚨 **Notice:** Only available when the `mode` parameter in the `connection` method is set to `"motion"`.
 
 Starts recording motion data.
 
-### `motion_stop(self)`
+#### `motion_stop(self)`
 > 🚨 **Notice:** Only available on certain models that supports gyro data.
+
 > 🚨 **Notice:** Only available when the `mode` parameter in the `connection` method is set to `"motion"`.
 
 Stops recording motion data and retrieves the recorded data.
