@@ -107,7 +107,7 @@ Returns the camera matrix based on the provided depth intrinsic.
 - **Returns:** `np.array` representing the camera matrix.
 
 
-### `xyz(self, pxl, depth_frame, depth_int, wnd=(0,0), z_gt=(10, 2000))`
+#### `xyz(self, pxl, depth_frame, depth_int, wnd=(0,0), z_gt=(10, 2000))`
 
 Convert camera pixel coordinates to its associated XYZ in the camera coordinate system.
 
@@ -123,7 +123,7 @@ Convert camera pixel coordinates to its associated XYZ in the camera coordinate 
   - `sample`: List of tuples, Sample pixel coordinates and corresponding XYZ values used in the estimation.
 
 
-### `xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane")`
+#### `xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane")`
 
 Find the XYZ coordinates of a given pixel with respect to a reference frame known to the user.
 
