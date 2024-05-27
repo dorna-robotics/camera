@@ -1,7 +1,6 @@
 import time
 import pyrealsense2 as rs
 import numpy as np
-import math
 import cv2
 import json
 import os
@@ -127,7 +126,7 @@ class Helper(object):
         pxl = np.array(pxl).astype(int)
 
         # lattice
-        lattice = np.array([[x,y] for x in range(math.floor(-wnd[0]/2), math.floor(wnd[0]/2)+1) for y in range(math.floor(-wnd[1]/2), math.floor(wnd[1]/2)+1)])
+        lattice = np.array([[x,y] for x in range(np.floor(-wnd[0]/2), np.floor(wnd[0]/2)+1) for y in range(np.floor(-wnd[1]/2), np.floor(wnd[1]/2)+1)])
         for l in lattice:
             try:
                 pxl_new = pxl + l 
