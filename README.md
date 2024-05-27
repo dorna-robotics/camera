@@ -106,15 +106,36 @@ Returns the camera matrix based on the provided depth intrinsic.
 
 - **Returns:** `np.array` representing the camera matrix.
 
-#### `xyz(self, pixel, depth_frame, depth_intrinsics)`
-Calculates the real-world 3D coordinates from the pixel coordinates and depth frame, in camera coordinate system.
+
+### `xyz(self, pxl, depth_frame, depth_int, wnd=(0,0), z_gt=(10, 2000))`
+
+Convert camera pixel coordinates to its associated XYZ in the camera coordinate system.
 
 - **Parameters:**
-  - `pixel`: A tuple of pixel coordinates `(x, y)`. `x` is the value in the width direction, and `y` is the value in the height direction.
-  - `depth_frame`: The depth frame from which to extract the depth value.
-  - `depth_intrinsics`: Depth intrinsic object.
+  - `pxl`: Tuple, Pixel coordinates to convert to XYZ. The pixel coordinate is given in `(pxl_x, pxl_y)` format where `pxl_x` is the pixel value in the width direction and `pxl_y` is the pixel value in the height direction, where `(0, 0)` is the top left corner of the image.
+  - `depth_frame`: Depth frame from the camera.
+  - `depth_int`: Intrinsic of the depth camera.
+  - `wnd`: Tuple, Window size of the pixels for averaging (default: (0,0)).
+  - `z_gt`: Tuple, ground truth range for valid depth values (default: (10, 2000)). If the minimum and maximum of `z_gt` is identical (`z_gt[0] == z_gt[1]`) then the method ignores the depth frame data and uses `z_gt` to estimate the XYZ.
 
-- **Returns:** A tuple containing the 3D coordinates `(x, y, z)` in millimeter (`mm`) and the depth value at the given pixel.
+- **Returns:**
+  - `xyz`: Numpy array, XYZ value in camera coordinate, corresponding to the input pixel. If `xyz == np.array([0, 0, 0])` then it means that the `xyz` value is not valid. 
+  - `sample`: List of tuples, Sample pixel coordinates and corresponding XYZ values used in the estimation.
+
+
+### `xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane")`
+
+Find the XYZ coordinates of a given pixel with respect to a reference frame known to the user.
+
+- **Parameters:**
+  - `pxl`: Tuple, Pixel coordinates of the point to estimate XYZ for.
+  - `pxl_ref`: List of tuples, Pixel coordinates of reference points in the reference frame.
+  - `xyz_ref`: List of tuples, Corresponding XYZ coordinates of the reference points.
+  - `method`: String, Method for estimating the XYZ coordinates. Options are `"plane"` (default, which is useful when the `xyz_ref` points are lying on a flat surface) or `"idw"` (stands for `inverse distance weighting`, which is a method used for spatial interpolation, where the value of a point is estimated based on the values of nearby known points, with weights assigned based on the inverse of their distances to the point being estimated).
+
+- **Returns:**
+  - `xyz`: Numpy array, Estimated XYZ coordinates of the input pixel.
+
 
 #### `dist_coeffs(self, depth_int)`
 Returns the distortion coefficients of the camera.
@@ -139,37 +160,6 @@ Starts recording motion data.
 Stops recording motion data and retrieves the recorded data.
 
 - **Returns:** Tuple containing lists of accelerometer data (`accel`) and gyroscope data (`gyro`).
-
-
-
-
-## Methods
-## 
-### Config
-The `config.json` file contains all the necessary configuration parameters for the camera. Read the `config.json` file as a Python dictionary and initiate the `camera` object. You can setup the path to the camera preset here as well. Go over the file to figure out different parameters.
-
-### Methods
-Here is the list of methods available for the `camera` object.
-
-#### `.on()`
-This method loads all the presets in the camera, enables the infrared, depth and RGB channels and starts the camera pipeline. 
-> Call this method to initiate the camera object and before getting any data from the camera. 
-
-#### `.off()`  
-This method stops the camera pipeline. 
-> Call this method when you don't need the camera object anymore.
-
-#### `.get_all(save = False, align_to = rs.stream.color)`
-This method returns frame, image and depth intrinsic data. 
-```python
-depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int = camera.get_all()
-```
-
-#### `.center(pxl, depth_frame, depth_int, r = 10, l = 20)`
-Returns the XYZ Cartesian coordinate of the pixel point `pxl`, given the depth frame and depth intrinsics data, in respect to the camera coordinate system. If the XYZ data is not valid for `pxl`. Then the method searches over the pixels inside the circle with radius `r`  and centered around `pxl`, finds the first closest `l` pixels with valid XYZ and average over their XYZs to estimate the XYZ for `pxl`. 
-
-#### `.length(pxl0, pxl1, depth_frame, depth_int, l =1000, start = 30)`
-Returns the euclidean distance between the two pixel points `pxl0` and `pxl1` in the real world, given the depth frame and depth intrinsic data.
 
 [dorna]: https://dorna.ai
 [realsense]: https://www.intelrealsense.com
