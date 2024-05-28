@@ -104,7 +104,7 @@ Returns the camera matrix based on the provided depth intrinsic.
   - `depth_int`: Depth intrinsic object.
   - `ratio` (default=1): Scaling ratio for the matrix.
 
-- **Returns:** `np.array` representing the camera matrix.
+- **Returns:** `numpy.array` representing the camera matrix.
 
 
 #### `xyz(self, pxl, depth_frame, depth_int, wnd=(0,0), z_gt=(10, 2000))`
@@ -119,7 +119,7 @@ Convert camera pixel coordinates to its associated XYZ in the camera coordinate 
   - `z_gt`: Tuple, ground truth range for valid depth values (default: (10, 2000)). If the minimum and maximum of `z_gt` is identical (`z_gt[0] == z_gt[1]`) then the method ignores the depth frame data and uses `z_gt` to estimate the XYZ.
 
 - **Returns:**
-  - `xyz`: Numpy array, XYZ value in camera coordinate, corresponding to the input pixel. If `xyz == np.array([0, 0, 0])` then it means that the `xyz` value is not valid. 
+  - `xyz`: `numpy.array`, XYZ value in camera coordinate, corresponding to the input pixel. If `xyz == numpy.array([0, 0, 0])` then it means that the `xyz` value is not valid. 
   - `sample`: List of tuples, Sample pixel coordinates and corresponding XYZ values used in the estimation.
 
 
@@ -134,7 +134,7 @@ Find the XYZ coordinates of a given pixel with respect to a reference frame know
   - `method`: String, Method for estimating the XYZ coordinates. Options are `"plane"` (default, which is useful when the `xyz_ref` points are lying on a flat surface) or `"idw"` (stands for `inverse distance weighting`, which is a method used for spatial interpolation, where the value of a point is estimated based on the values of nearby known points, with weights assigned based on the inverse of their distances to the point being estimated).
 
 - **Returns:**
-  - `xyz`: Numpy array, Estimated XYZ coordinates of the input pixel.
+  - `xyz`: `numpy.array`, Estimated XYZ coordinates of the input pixel.
 
 
 #### `dist_coeffs(self, depth_int)`
@@ -143,7 +143,7 @@ Returns the distortion coefficients of the camera.
 - **Parameters:**
   - `depth_int`: Depth intrinsic object.
 
-- **Returns:** `np.array` containing the distortion coefficients.
+- **Returns:** `numpy.array` containing the distortion coefficients.
 
 #### `motion_rec(self)`
 > 🚨 **Notice:** Only available on certain models that supports gyro data.
