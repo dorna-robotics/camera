@@ -236,6 +236,16 @@ class Camera(Helper):
     def __init__(self):
         super(Camera, self).__init__()
 
+        # all devices
+        if not hasattr(rs, '_all_device'):
+            # Create a context object
+            ctx = rs.context()
+    
+            # Get a list of all connected devices
+            devices = ctx.query_devices()
+            
+            rs._all_device = list([{"name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number), "obj": device} for device in devices])
+
 
     def camera_matrix(self, depth_int, ratio=1):
         if ratio is None and type(self.filter) == dict and "decimate" in self.filter:
@@ -283,14 +293,9 @@ class Camera(Helper):
         # Get aligned frames
         return depth_frame, ir_frame, color_frame, frames
 
+    
     def all_device(self):
-        # Create a context object
-        ctx = rs.context()
-
-        # Get a list of all connected devices
-        devices = ctx.query_devices()
-
-        return [{"all": device, "name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number)} for device in devices]
+        return list(rs._all_device)
 
 
     def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}) :
@@ -304,18 +309,18 @@ class Camera(Helper):
         config = rs.config()
         
         # serial number and name
-        all_device = self.all_device()
         if serial_number:
             config.enable_device(serial_number)
-            for device in all_device:
+            
+            for device in self.all_device():
                 if device['serial_number'] == serial_number:
                     name = device['name']
                     break
+            
         else:
-            serial_number = all_device[0]["serial_number"]
-            name = all_device[0]["name"]
-        
-        config.enable_device(serial_number)
+            serial_number = self.all_device()[0]["serial_number"]
+            name = self.all_device()[0]["name"]
+            config.enable_device(serial_number)
 
         # preset
         # assign preset if not exists
