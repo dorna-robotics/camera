@@ -8,14 +8,17 @@ camera = Camera()
 # connect to the camera 
 camera.connect(filter={})
 
+# set exposure
+camera.exposure(exposure=50000, gain=30)
+
 # display depth image in a while loop, until press "q"
 while True:
     # get the camera data
     depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, timestamp = camera.get_all()
     
     # display depth image
-    cv2.imshow("depth_img", depth_img)
-    #cv2.imshow("color_img", color_img)
+    #cv2.imshow("depth_img", depth_img)
+    cv2.imshow("color_img", color_img)
 
     # get xyz in camera frame of the center pixel in the image
     height, width, _ = depth_img.shape
