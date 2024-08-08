@@ -6,10 +6,7 @@ import cv2
 camera = Camera()
 
 # connect to the camera 
-camera.connect(filter={})
-
-# set exposure
-camera.exposure(exposure=50000, gain=30)
+camera.connect(filter={}, exposure=50000, gain=30)
 
 # display depth image in a while loop, until press "q"
 while True:

@@ -298,7 +298,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
 
-    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}):
+    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}, exposure=None, gain=None):
         # filter
         self.filter = filter
 
@@ -393,24 +393,13 @@ class Camera(Helper):
             #rs.option.global_time_enabled
             self.sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
             
-            #self.sensor_dep.set_option(rs.option.exposure, exposure_limit)
-            #self.sensor_dep.set_option(rs.option.gain, gain_limit)
+            if exposure:
+                sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
+            if gain:
+                sensor_dep.set_option(rs.option.gain, min(248, max(16, gain)))
+
 
             return True
-
-
-    def exposure(self, exposure=None, gain=None):
-        # Query minimum and maximum supported values
-        max_exp = self.sensor_dep.get_option_range(rs.option.exposure).max
-        min_exp = self.sensor_dep.get_option_range(rs.option.exposure).min
-        # Query minimum and maximum supported values
-        max_gain = self.sensor_dep.get_option_range(rs.option.gain).max
-        min_gain = self.sensor_dep.get_option_range(rs.option.gain).min
-        
-        if exposure:
-            self.sensor_dep.set_option(rs.option.exposure, min(max_exp, max(min_exp, exposure)))
-        if gain:
-            self.sensor_dep.set_option(rs.option.gain, min(max_gain, max(min_gain, gain)))
 
 
     def close(self):
