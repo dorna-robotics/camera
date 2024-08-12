@@ -298,7 +298,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
 
-    def connect(self, serial_number="", mode="rgbd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}, exposure=None, gain=None):
+    def connect(self, serial_number="", mode="bgrd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}, exposure=None):
         # filter
         self.filter = filter
 
@@ -394,12 +394,18 @@ class Camera(Helper):
             self.sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
             
             if exposure:
-                sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
-            if gain:
-                sensor_dep.set_option(rs.option.gain, min(248, max(16, gain)))
-
+                self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
 
             return True
+
+
+    def get_exposure(self):
+        return self.sensor_dep.get_option(rs.option.exposure)
+
+
+    def set_exposure(self, exposure):
+        self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
+        return self.get_exposure()
 
 
     def close(self):
