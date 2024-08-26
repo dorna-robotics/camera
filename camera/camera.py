@@ -297,8 +297,8 @@ class Camera(Helper):
     def all_device(self):
         return list(rs._all_device)
 
-
-    def connect(self, serial_number="", mode="bgrd", preset_path=None, filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}, exposure=None):
+    #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
+    def connect(self, serial_number="", mode="bgrd", preset_path=None, filter={}, exposure=None):
         # filter
         self.filter = filter
 
