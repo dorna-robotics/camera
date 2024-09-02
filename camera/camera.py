@@ -276,8 +276,6 @@ class Camera(Helper):
         depth_frame = aligned_frames.get_depth_frame()
         ir_frame = aligned_frames.get_infrared_frame()
         color_frame = aligned_frames.get_color_frame()
-
-
         # filters
         if self.decimate:
             depth_frame = self.decimate.process(depth_frame)
