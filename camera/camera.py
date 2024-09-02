@@ -105,76 +105,78 @@ class Helper(object):
     linear model: xyz = T*pixel + B => change it to a over determined model Ax = b and find x ()
     wnd : the window size of the pixels
     """
-    def xyz(self, pxl, depth_frame, depth_int, wnd = (0,0), z_gt=(10, 2000)): 
-        if type(self.filter) == dict and "decimate" in self.filter:
-            pxl = [x/self.filter["decimate"] for x in pxl]
-
+    def xyz(self, pxl, depth_frame, depth_int, wnd = (0,0), z_gt=(10, 10000)): 
         sample_pxl = []
         sample_xyz = []
         xyz = np.array([0. for i in range(3)])
+        try:
+            if type(self.filter) == dict and "decimate" in self.filter:
+                pxl = [x/self.filter["decimate"] for x in pxl]
 
-        # ground truth is given
-        if z_gt[0] == z_gt[1]:
-            xyz = z_gt[0]*np.array([(pxl[0]-depth_int.ppx)/depth_int.fx, (pxl[1]-depth_int.ppy)/depth_int.fy, 1]) 
-            return xyz, [v for v in zip(sample_pxl, sample_xyz)]
 
-        # number of row and column
-        dim = np.asanyarray(depth_frame.get_data()).shape
+            # ground truth is given
+            if z_gt[0] == z_gt[1]:
+                xyz = z_gt[0]*np.array([(pxl[0]-depth_int.ppx)/depth_int.fx, (pxl[1]-depth_int.ppy)/depth_int.fy, 1]) 
+                return xyz, [v for v in zip(sample_pxl, sample_xyz)]
 
-        # make a copy and pixel to int
-        pxl_org = np.array(pxl)
-        pxl = np.array(pxl).astype(int)
+            # number of row and column
+            dim = np.asanyarray(depth_frame.get_data()).shape
 
-        # lattice
-        lattice = np.array([[x,y] for x in range(int(np.floor(-wnd[0]/2)), int(np.floor(wnd[0]/2))+1) for y in range(int(np.floor(-wnd[1]/2)), int(np.floor(wnd[1]/2))+1)])
-        for l in lattice:
-            try:
-                pxl_new = pxl + l 
-                # make sure pixels are not out of range
-                if any([pxl_new[0] < 0, pxl_new[0] >= dim[1], pxl_new[1] < 0, pxl_new[1] >= dim[0]]):
-                    continue
+            # make a copy and pixel to int
+            pxl_org = np.array(pxl)
+            pxl = np.array(pxl).astype(int)
 
-                # calculate xyz
-                xyz_new = rs.rs2_deproject_pixel_to_point(depth_int, pxl_new.tolist(), depth_frame.get_distance(pxl_new[0], pxl_new[1]))
-                xyz_new  = 1000 * np.array(xyz_new) # in mm  
+            # lattice
+            lattice = np.array([[x,y] for x in range(int(np.floor(-wnd[0]/2)), int(np.floor(wnd[0]/2))+1) for y in range(int(np.floor(-wnd[1]/2)), int(np.floor(wnd[1]/2))+1)])
+            for l in lattice:
+                try:
+                    pxl_new = pxl + l 
+                    # make sure pixels are not out of range
+                    if any([pxl_new[0] < 0, pxl_new[0] >= dim[1], pxl_new[1] < 0, pxl_new[1] >= dim[0]]):
+                        continue
 
-                if xyz_new[2] > z_gt[1] or xyz_new[2] < z_gt[0]:
-                    continue
+                    # calculate xyz
+                    xyz_new = rs.rs2_deproject_pixel_to_point(depth_int, pxl_new.tolist(), depth_frame.get_distance(pxl_new[0], pxl_new[1]))
+                    xyz_new  = 1000 * np.array(xyz_new) # in mm  
 
-                sample_pxl.append(pxl_new)
-                sample_xyz.append(xyz_new)
+                    if xyz_new[2] > z_gt[1] or xyz_new[2] < z_gt[0]:
+                        continue
 
-            except Exception as ex:
-                print("error: ", ex)
-                pass
+                    sample_pxl.append(pxl_new)
+                    sample_xyz.append(xyz_new)
 
-        if list(wnd) == [0, 0] and len(sample_xyz) == 1: 
-                xyz = sample_xyz[0]
+                except Exception as ex:
+                    print("error: ", ex)
+                    pass
 
-        # there are enough data to run the over determined system
-        elif len(sample_pxl):
-            A = np.zeros(9)
-            b = np.zeros(1)
-            for p in sample_pxl:
-                t0 = np.hstack((p, [0, 0], [0, 0], [1, 0, 0]))
-                t1 = np.hstack(([0, 0],p, [0, 0], [0, 1, 0]))
-                t2 = np.hstack(([0, 0], [0, 0],p, [0, 0, 1]))  
-                A = np.vstack((A, t0, t1, t2))
-            A = np.delete(A, (0), axis=0)               
-            
-            for xyz in sample_xyz:
-                b = np.vstack((b, xyz[0], xyz[1], xyz[2]))
-            b = np.delete(b, (0), axis=0)   
+            if list(wnd) == [0, 0] and len(sample_xyz) == 1: 
+                    xyz = sample_xyz[0]
 
-            # Ax = b
-            x = np.linalg.lstsq(A,b, rcond=None)[0] # computing the numpy solution
+            # there are enough data to run the over determined system
+            elif len(sample_pxl):
+                A = np.zeros(9)
+                b = np.zeros(1)
+                for p in sample_pxl:
+                    t0 = np.hstack((p, [0, 0], [0, 0], [1, 0, 0]))
+                    t1 = np.hstack(([0, 0],p, [0, 0], [0, 1, 0]))
+                    t2 = np.hstack(([0, 0], [0, 0],p, [0, 0, 1]))  
+                    A = np.vstack((A, t0, t1, t2))
+                A = np.delete(A, (0), axis=0)               
+                
+                for xyz in sample_xyz:
+                    b = np.vstack((b, xyz[0], xyz[1], xyz[2]))
+                b = np.delete(b, (0), axis=0)   
 
-            T = np.hstack((x[0:2], x[2:4], x[4:6]))
-            B = np.transpose(x[6:9])
+                # Ax = b
+                x = np.linalg.lstsq(A,b, rcond=None)[0] # computing the numpy solution
 
-            xyz = np.matrix(pxl_org) * T + B
-            xyz = np.asarray(xyz).reshape(-1)
+                T = np.hstack((x[0:2], x[2:4], x[4:6]))
+                B = np.transpose(x[6:9])
 
+                xyz = np.matrix(pxl_org) * T + B
+                xyz = np.asarray(xyz).reshape(-1)
+        except:
+            pass
         return xyz, [v for v in zip(sample_pxl, sample_xyz)]
 
 
@@ -274,6 +276,8 @@ class Camera(Helper):
         depth_frame = aligned_frames.get_depth_frame()
         ir_frame = aligned_frames.get_infrared_frame()
         color_frame = aligned_frames.get_color_frame()
+
+
         # filters
         if self.decimate:
             depth_frame = self.decimate.process(depth_frame)
