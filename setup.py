@@ -19,7 +19,10 @@ setuptools.setup(
     url="https://dorna.ai/",
     project_urls={
         'gitHub': 'https://github.com/dorna-robotics/camera',
-    },    
+    },
+    package_data={
+        'camera': ['preset/*'],
+    },     
     packages=setuptools.find_packages(),
     classifiers=[
         'Intended Audience :: Developers',

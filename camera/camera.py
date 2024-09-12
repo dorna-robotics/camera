@@ -1,9 +1,9 @@
+import importlib.resources
 import time
 import pyrealsense2 as rs
 import numpy as np
 import cv2
 import json
-import os
 import threading
 import queue
 """
@@ -327,14 +327,13 @@ class Camera(Helper):
         # preset
         # assign preset if not exists
         if not preset_path:
-            # Get the directory of the current module
-            module_dir = os.path.dirname(__file__)
-
-            # Construct the path to the JSON file
-            preset_path = os.path.join(module_dir, 'preset', name.replace(" ", "_")+".json")
+            with importlib.resources.path("camera.preset", name.replace(" ", "_")+".json") as config_file:
+                with open(config_file, 'r') as file:
+                    self.preset = json.load(file)
+        else:
+            self.preset = json.load(open(preset_path))
 
         # json string
-        self.preset = json.load(open(preset_path))
         self.preset_string = json.dumps(self.preset)
 
         # stream
