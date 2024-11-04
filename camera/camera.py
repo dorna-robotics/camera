@@ -309,7 +309,7 @@ class Camera(Helper):
 
         #Create a config and configure the pipeline to stream
         config = rs.config()
-        
+
         # serial number and name
         if serial_number:
             config.enable_device(serial_number)
