@@ -21,7 +21,7 @@ class Helper(object):
     find the xyz of a given pixel with respect to a frame known to the user
     method: bilinear, plane, idw
     """
-    def xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane"):
+    def xyz_estimate(self, pxl, pxl_ref, xyz_ref, method="plane", power=2):
         # init
         xyz = np.array([0. for i in range(3)])
         
