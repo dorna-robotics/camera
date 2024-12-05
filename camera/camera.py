@@ -306,6 +306,7 @@ class Camera(Helper):
 
         # Create a pipeline
         self.pipeline = rs.pipeline()
+        
 
         #Create a config and configure the pipeline to stream
         config = rs.config()
