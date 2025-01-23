@@ -352,7 +352,7 @@ class Camera(Helper):
             # apply advanced mode
             device = profile.get_device()
             self.advnc_mode = rs.rs400_advanced_mode(device)
-            self.advnc_mode.load_json(self.preset_string)
+            #self.advnc_mode.load_json(self.preset_string)
 
             # decimate
             if type(self.filter) == dict and "decimate" in self.filter and self.filter["decimate"] != None:
