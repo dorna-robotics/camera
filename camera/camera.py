@@ -343,12 +343,17 @@ class Camera(Helper):
             config.enable_stream(rs.stream.gyro)
             profile = self.pipeline.start(config)
         else:
-            config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
-            config.enable_stream(rs.stream.infrared, 1, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
-            config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
-
-            profile = self.pipeline.start(config)
-
+            try:
+                config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
+                config.enable_stream(rs.stream.infrared, 1, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
+                config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
+                profile = self.pipeline.start(config)                
+            except:
+                config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
+                config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
+                config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 15)
+                profile = self.pipeline.start(config)
+                
             # apply advanced mode
             device = profile.get_device()
             self.advnc_mode = rs.rs400_advanced_mode(device)
