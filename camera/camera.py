@@ -180,6 +180,32 @@ class Helper(object):
         return xyz, [v for v in zip(sample_pxl, sample_xyz)]
 
 
+    def pixel(self, xyz, depth_int):
+        """
+        intr: rs.intrinsics from depth_profile.get_intrinsics()
+        point3d: (X,Y,Z) in the same units (meters) intr expects.
+        """
+        X, Y, Z = xyz
+        if Z == 0:
+            return 0, 0
+        
+        # normalized coordinates
+        x = X / Z
+        y = Y / Z
+
+        # distortion
+        k1, k2, p1, p2, k3 = depth_int.coeffs
+        r2 = x*x + y*y
+        x_dist = x*(1 + k1*r2 + k2*r2*r2 + k3*r2*r2*r2) \
+                + 2*p1*x*y + p2*(r2 + 2*x*x)
+        y_dist = y*(1 + k1*r2 + k2*r2*r2 + k3*r2*r2*r2) \
+                + 2*p2*x*y + p1*(r2 + 2*y*y)
+
+        u = depth_int.fx * x_dist + depth_int.ppx
+        v = depth_int.fy * y_dist + depth_int.ppy
+        return u, v
+
+
     """
     give two pixels
     find the distance between them
