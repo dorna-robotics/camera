@@ -326,7 +326,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
     #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
-    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}):
+    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, start=True):
         # filter
         self.filter = filter
 
@@ -406,6 +406,9 @@ class Camera(Helper):
             if exposure:
                 self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
 
+            
+            if start:
+                self.get_all()
             return True
 
 
