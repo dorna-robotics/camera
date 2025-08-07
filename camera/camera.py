@@ -326,7 +326,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
     #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
-    def connect(self, serial_number="", mode="bgrd", preset_path=None, filter={}, exposure=None):
+    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}):
         # filter
         self.filter = filter
 
@@ -337,31 +337,10 @@ class Camera(Helper):
         #Create a config and configure the pipeline to stream
         config = rs.config()
 
-        # serial number and name
-        if serial_number:
-            config.enable_device(serial_number)
-            
-            for device in self.all_device():
-                if device['serial_number'] == serial_number:
-                    name = device['name']
-                    break
-            
-        else:
+        # serial number
+        if not serial_number:
             serial_number = self.all_device()[0]["serial_number"]
-            name = self.all_device()[0]["name"]
-            config.enable_device(serial_number)
-
-        # preset
-        # assign preset if not exists
-        if not preset_path:
-            with importlib.resources.path("camera.preset", name.replace(" ", "_")+".json") as config_file:
-                with open(config_file, 'r') as file:
-                    self.preset = json.load(file)
-        else:
-            self.preset = json.load(open(preset_path))
-
-        # json string
-        self.preset_string = json.dumps(self.preset)
+        config.enable_device(serial_number)
 
         # stream
         if mode == "motion":
@@ -370,9 +349,9 @@ class Camera(Helper):
             profile = self.pipeline.start(config)
         else:
             try:
-                config.enable_stream(rs.stream.depth, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.z16, int(self.preset["viewer"]["stream-fps"]))
-                config.enable_stream(rs.stream.infrared, 1, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.y8, int(self.preset["viewer"]["stream-fps"]))
-                config.enable_stream(rs.stream.color, int(self.preset["viewer"]["stream-width"]), int(self.preset["viewer"]["stream-height"]), rs.format.bgr8, int(self.preset["viewer"]["stream-fps"]))
+                config.enable_stream(rs.stream.depth, stream["width"], stream["height"], rs.format.z16, stream["fps"])
+                config.enable_stream(rs.stream.infrared, 1, stream["width"], stream["height"], rs.format.y8, stream["fps"])
+                config.enable_stream(rs.stream.color, stream["width"], stream["height"], rs.format.bgr8, stream["fps"])
                 profile = self.pipeline.start(config)                
             except:
                 config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
@@ -383,7 +362,6 @@ class Camera(Helper):
             # apply advanced mode
             device = profile.get_device()
             self.advnc_mode = rs.rs400_advanced_mode(device)
-            #self.advnc_mode.load_json(self.preset_string)
 
             # decimate
             if type(self.filter) == dict and "decimate" in self.filter and self.filter["decimate"] != None:
