@@ -1,11 +1,11 @@
-import importlib.resources
 import time
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-import json
 import threading
 import queue
+import random
+
 """
 Euclidean dimension is in mm
 """
@@ -333,13 +333,12 @@ class Camera(Helper):
         # Create a pipeline
         self.pipeline = rs.pipeline()
         
-
         #Create a config and configure the pipeline to stream
         config = rs.config()
 
         # serial number
         if not serial_number:
-            serial_number = self.all_device()[0]["serial_number"]
+            serial_number = random.choice(self.all_device())["serial_number"]
         config.enable_device(serial_number)
 
         # stream
