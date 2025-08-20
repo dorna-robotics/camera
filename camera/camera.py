@@ -326,7 +326,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
     #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
-    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, start=True):
+    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, start=True):
         # filter
         self.filter = filter
 
@@ -406,6 +406,27 @@ class Camera(Helper):
             if exposure:
                 self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
 
+            # K and D
+            self.intr = None
+            if K is not None and D is not None:
+                K = np.array(K)
+                D = np.array(D)
+                # Create a new rs.intrinsics object
+                self.intr = rs.intrinsics()
+                self.intr.width  = stream["width"]
+                self.intr.height = stream["height"]
+                self.intr.ppx    = float(K[0, 2])  # cx
+                self.intr.ppy    = float(K[1, 2])  # cy
+                self.intr.fx     = float(K[0, 0])  # fx
+                self.intr.fy     = float(K[1, 1])  # fy
+
+                # Use Brown-Conrady distortion model (OpenCV's standard k1,k2,p1,p2,k3)
+                self.intr.model  = rs.distortion.brown_conrady
+
+                # Assign the 5 distortion coefficients
+                self.intr.coeffs = [float(D[0]), float(D[1]), float(D[2]),
+                                    float(D[3]), float(D[4])]
+
             
             if start:
                 self.get_all()
@@ -440,7 +461,10 @@ class Camera(Helper):
         depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
         ir_img = np.asanyarray(ir_frame.get_data())
         color_img = np.asanyarray(color_frame.get_data())
-        depth_int = rs.video_stream_profile(color_frame.profile).get_intrinsics()
+        if self.intr is not None:
+            depth_int = self.intr
+        else:
+            depth_int = rs.video_stream_profile(color_frame.profile).get_intrinsics()
 
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, frames.get_timestamp()/1000
 
