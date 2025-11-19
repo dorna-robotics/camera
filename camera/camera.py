@@ -326,7 +326,7 @@ class Camera(Helper):
         return list(rs._all_device)
 
     #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
-    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, start=True):
+    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, native_res=None, start=True):
         # filter
         self.filter = filter
 
@@ -411,14 +411,19 @@ class Camera(Helper):
             if K is not None and D is not None:
                 K = np.array(K)
                 D = np.array(D)
+                sx = 1
+                sy = 1
+                if native_res is not None:
+                    sx = stream["width"] / native_res[0]
+                    sy = stream["height"] / native_res[1]
                 # Create a new rs.intrinsics object
                 self.intr = rs.intrinsics()
                 self.intr.width  = stream["width"]
                 self.intr.height = stream["height"]
-                self.intr.ppx    = float(K[0, 2])  # cx
-                self.intr.ppy    = float(K[1, 2])  # cy
-                self.intr.fx     = float(K[0, 0])  # fx
-                self.intr.fy     = float(K[1, 1])  # fy
+                self.intr.ppx    = float(K[0, 2]) * sx  # cx
+                self.intr.ppy    = float(K[1, 2]) * sy  # cy
+                self.intr.fx     = float(K[0, 0]) * sx  # fx
+                self.intr.fy     = float(K[1, 1]) * sy  # fy
 
                 # Use Brown-Conrady distortion model (OpenCV's standard k1,k2,p1,p2,k3)
                 self.intr.model  = rs.distortion.brown_conrady
