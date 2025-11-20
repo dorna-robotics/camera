@@ -404,7 +404,7 @@ class Camera(Helper):
             self.sensor_dep.set_option(rs.option.global_time_enabled, 1) # time
             
             if exposure:
-                self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
+                self.set_exposure(exposure)
 
             # K and D
             self.intr = None
@@ -437,16 +437,30 @@ class Camera(Helper):
                 self.get_all()
             return True
 
+    def warmup(self, sec=600, sleep=0.1):
+        n = int(sec / sleep)
+        for _ in range(n):
+            self.get_all()
+            time.sleep(sleep)
+
+
+    def get_temp(self):
+        return self.sensor_dep.get_option(rs.option.asic_temperature)
+
 
     def get_exposure(self):
         return self.sensor_dep.get_option(rs.option.exposure)
 
 
     def set_exposure(self, exposure):
+        self.auto_exposure(False)
         self.sensor_dep.set_option(rs.option.exposure, min(165000, max(1, exposure)))
         return self.get_exposure()
 
-
+    def auto_exposure(self, enable=True):
+        self.sensor_dep.set_option(rs.option.enable_auto_exposure, 1 if enable else 0)
+        return self.get_exposure()
+    
     def close(self):
         try:
             self.pipeline.stop()
@@ -458,7 +472,7 @@ class Camera(Helper):
     """
     get frame, image and depth intrinsic data
     """
-    def get_all(self, align_to=rs.stream.color, alpha=0.03):
+    def get_all(self, align_to=rs.stream.infrared, alpha=0.03): # rs.stream.color
         # Create an align object
         depth_frame, ir_frame, color_frame, frames = self.frame(align_to)
 
