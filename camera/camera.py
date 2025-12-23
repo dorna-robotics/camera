@@ -432,7 +432,6 @@ class Camera(Helper):
                 self.intr.coeffs = [float(D[0]), float(D[1]), float(D[2]),
                                     float(D[3]), float(D[4])]
 
-            
             if start:
                 self.get_all()
             return True
