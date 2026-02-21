@@ -5,6 +5,9 @@ import cv2
 import threading
 import queue
 import random
+import subprocess
+import os
+
 
 """
 Euclidean dimension is in mm
@@ -272,7 +275,95 @@ class Camera(Helper):
             # Get a list of all connected devices
             devices = ctx.query_devices()
             
-            rs._all_device = list([{"name": device.get_info(rs.camera_info.name), "serial_number": device.get_info(rs.camera_info.serial_number), "obj": device} for device in devices])
+            rs._all_device = list([{
+                    "name": device.get_info(rs.camera_info.name), 
+                    "serial_number": device.get_info(rs.camera_info.serial_number), 
+                    "usb_type": device.get_info(rs.camera_info.usb_type_descriptor), 
+                    "usb_port": device.get_info(rs.camera_info.physical_port) , 
+                    "obj": device
+                } for device in devices])
+
+
+    def _sh(self, cmd, timeout=10):
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout
+
+    def _hw_reset(self):
+        # firmware reset by serial (only affects this camera)
+        ctx = rs.context()
+        for dev in ctx.query_devices():
+            if dev.get_info(rs.camera_info.serial_number) == self.serial_number:
+                dev.hardware_reset()
+                return True
+        return False
+
+    def _usb_unbind_bind(self):
+        # Linux only
+        if os.name != "posix":
+            return False
+        
+        # linux USB reset by topology path like '4-1-2' (requires sudo)
+        if not getattr(self, "usb_port", None):
+            return False
+        port = self.usb_port
+        rc, out = self._sh(["bash", "-lc", f"echo '{port}' | sudo tee /sys/bus/usb/drivers/usb/unbind"], timeout=5)
+        time.sleep(2)
+        rc2, out2 = self._sh(["bash", "-lc", f"echo '{port}' | sudo tee /sys/bus/usb/drivers/usb/bind"], timeout=5)
+        time.sleep(3)
+        return (rc == 0 and rc2 == 0)
+
+    def _recover(self):
+        # stop pipeline first
+        try:
+            self.pipeline.stop()
+        except:
+            pass
+
+        # 1) try RealSense firmware reset
+        try:
+            self._hw_reset()
+        except:
+            pass
+        time.sleep(5)
+
+        # reconnect (no recursion: start=False)
+        try:
+            self.connect(
+                serial_number=self.serial_number,
+                mode=self.mode,
+                filter=self.filter,
+                exposure=self.exposure_set,
+                stream=self.stream,
+                K=self.K,
+                D=self.D,
+                native_res=self.native_res,
+                start=False
+            )
+            return True
+        except:
+            pass
+
+        # 2) escalate: USB unbind/bind then reconnect
+        try:
+            if self._usb_unbind_bind():
+                self.connect(
+                    serial_number=self.serial_number,
+                    mode=self.mode,
+                    filter=self.filter,
+                    exposure=self.exposure_set,
+                    stream=self.stream,
+                    K=self.K,
+                    D=self.D,
+                    native_res=self.native_res,
+                    start=False
+                )
+                return True
+        except:
+            pass
+
+        return False
+
 
 
     def camera_matrix(self, depth_int, ratio=1):
@@ -288,20 +379,28 @@ class Camera(Helper):
         return np.array(depth_int.coeffs)
 
 
-    def frame(self, align_to, time_out=10):
-        # Get frameset of ir and depth
-        frames = self.pipeline.wait_for_frames(1000 * time_out)
+    def frame(self, align_to, time_out=5):
+        # self-healing wait_for_frames
+        try:
+            frames = self.pipeline.wait_for_frames(1000 * time_out)
+        except (rs.error, RuntimeError):
+            # attempt recovery inside API
+            if not self._recover():
+                raise
+            # retry once after recover
+            frames = self.pipeline.wait_for_frames(1000 * time_out)
 
         # Create an align object
         align = rs.align(align_to)
 
         # Align the depth frame to ir frame
         aligned_frames = align.process(frames)
-        
+
         # frames
         depth_frame = aligned_frames.get_depth_frame()
         ir_frame = aligned_frames.get_infrared_frame()
         color_frame = aligned_frames.get_color_frame()
+
         # filters
         if self.decimate:
             depth_frame = self.decimate.process(depth_frame)
@@ -317,8 +416,7 @@ class Camera(Helper):
             depth_frame = self.hole_filling.process(depth_frame)
 
         depth_frame = depth_frame.as_depth_frame()
-        
-        # Get aligned frames
+
         return depth_frame, ir_frame, color_frame, frames
 
     
@@ -329,6 +427,29 @@ class Camera(Helper):
     def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, native_res=None, start=True):
         # filter
         self.filter = filter
+        # --- store params for recovery ---
+        self.serial_number = serial_number  # will be filled after selection below
+        self.mode = mode
+        self.stream = stream
+        self.exposure_set = exposure
+        self.K = K
+        self.D = D
+        self.native_res = native_res
+        self.start = start
+
+        # --- filters ---
+        if "decimate" in self.filter:
+            self.decimate = rs.decimation_filter(self.filter["decimate"])
+        if "depth_to_disparity" in self.filter:
+            self.depth_to_disparity = rs.disparity_transform(self.filter["depth_to_disparity"])
+        if "spatial" in self.filter:
+            self.spatial = rs.spatial_filter(self.filter["spatial"][0], self.filter["spatial"][1], self.filter["spatial"][2])
+        if "temporal" in self.filter:
+            self.temporal = rs.temporal_filter(self.filter["temporal"][0], self.filter["temporal"][1])
+        if "disparity_to_depth" in self.filter:
+            self.disparity_to_depth = rs.disparity_transform(self.filter["disparity_to_depth"])
+        if "hole_filling" in self.filter:
+            self.hole_filling = rs.hole_filling_filter(self.filter["hole_filling"])
 
         # Create a pipeline
         self.pipeline = rs.pipeline()
@@ -340,6 +461,14 @@ class Camera(Helper):
         if not serial_number:
             serial_number = random.choice(self.all_device())["serial_number"]
         config.enable_device(serial_number)
+        self.serial_number = serial_number
+        
+        # usb port
+        self.usb_port = None
+        for d in self.all_device():
+            if d["serial_number"] == serial_number:
+                self.usb_port = d.get("usb_port", None)
+                break
 
         # stream
         if mode == "motion":
