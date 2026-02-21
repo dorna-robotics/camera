@@ -383,11 +383,11 @@ class Camera(Helper):
         # self-healing wait_for_frames
         try:
             frames = self.pipeline.wait_for_frames(1000 * time_out)
-        except (rs.error, RuntimeError):
-            # attempt recovery inside API
+        except RuntimeError:
             if not self._recover():
                 raise
             # retry once after recover
+            print("Recovery successful, retrying frame capture...")
             frames = self.pipeline.wait_for_frames(1000 * time_out)
 
         # Create an align object
