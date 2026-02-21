@@ -284,7 +284,7 @@ class Camera(Helper):
                 } for device in devices])
 
 
-    def _sh(self, cmd, timeout=10):
+    def _sh(self, cmd, timeout=5):
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True, timeout=timeout)
         return p.returncode, p.stdout
