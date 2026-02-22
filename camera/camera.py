@@ -284,6 +284,40 @@ class Camera(Helper):
                 } for device in devices])
 
 
+    def _refresh_devices(self):
+        """Refresh cached device list (important after reset / replug)."""
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        rs._all_device = list([{
+            "name": device.get_info(rs.camera_info.name),
+            "serial_number": device.get_info(rs.camera_info.serial_number),
+            "usb_type": device.get_info(rs.camera_info.usb_type_descriptor),
+            "usb_port": device.get_info(rs.camera_info.physical_port),
+            "obj": device
+        } for device in devices])
+        return rs._all_device
+
+    def _wait_for_device(self, serial_number: str, timeout: float = 10.0, sleep: float = 0.25) -> bool:
+        """Wait until a device with given serial appears."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                devs = self._refresh_devices()
+                if any(d["serial_number"] == serial_number for d in devs):
+                    return True
+            except Exception:
+                pass
+            time.sleep(sleep)
+        return False
+
+    def _stop_pipeline_quiet(self):
+        try:
+            if getattr(self, "pipeline", None) is not None:
+                self.pipeline.stop()
+        except Exception:
+            pass
+
+
     def _sh(self, cmd, timeout=5):
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True, timeout=timeout)
@@ -423,8 +457,248 @@ class Camera(Helper):
     def all_device(self):
         return list(rs._all_device)
 
+
+    # filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
+    def connect(
+        self,
+        serial_number="",
+        mode="bgrd",
+        filter={},
+        exposure=None,
+        stream={"width":848, "height":480, "fps":15},
+        K=None,
+        D=None,
+        native_res=None,
+        start=True,
+        # production controls:
+        max_tries=3,
+        recover_on_fail=True,
+        raise_on_fail=False,
+        device_wait_sec=10.0
+    ):
+        """
+        Production-safe connect:
+        - returns True on success
+        - returns False on failure (no exception) unless raise_on_fail=True
+        - on failure, attempts: hw reset -> usb unbind/bind (Linux) -> retry
+        """
+
+        # store params for recovery and later use
+        self.filter = filter
+        self.serial_number = serial_number  # may be filled after selection below
+        self.mode = mode
+        self.stream = stream
+        self.exposure_set = exposure
+        self.K = K
+        self.D = D
+        self.native_res = native_res
+        self.start = start
+
+        # always stop any previous pipeline quietly
+        self._stop_pipeline_quiet()
+
+        # refresh device list (important if previously disconnected/replugged)
+        try:
+            self._refresh_devices()
+        except Exception:
+            pass
+
+        # choose serial if not provided
+        if not serial_number:
+            devs = self.all_device()
+            if not devs:
+                if raise_on_fail:
+                    raise RuntimeError("No RealSense devices found.")
+                return False
+            serial_number = random.choice(devs)["serial_number"]
+        self.serial_number = serial_number
+
+        # wait for device to be present (helps after resets)
+        if not self._wait_for_device(serial_number, timeout=device_wait_sec):
+            if raise_on_fail:
+                raise RuntimeError(f"RealSense device not present (serial={serial_number}).")
+            return False
+
+        # resolve usb_port fresh (can change after replug)
+        self.usb_port = None
+        try:
+            for d in self.all_device():
+                if d["serial_number"] == serial_number:
+                    self.usb_port = d.get("usb_port", None)
+                    break
+        except Exception:
+            self.usb_port = None
+
+        # prepare filter objects (safe defaults)
+        # (these are set again after pipeline start too; keeping this light)
+        self.decimate = None
+        self.depth_to_disparity = None
+        self.spatial = None
+        self.temporal = None
+        self.disparity_to_depth = None
+        self.hole_filling = None
+
+        def _start_pipeline_once():
+            # Create a pipeline and config each attempt (important!)
+            self.pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_device(serial_number)
+
+            if mode == "motion":
+                config.enable_stream(rs.stream.accel)
+                config.enable_stream(rs.stream.gyro)
+                profile = self.pipeline.start(config)
+                return profile
+
+            # normal streams
+            try:
+                config.enable_stream(rs.stream.depth, stream["width"], stream["height"], rs.format.z16, stream["fps"])
+                config.enable_stream(rs.stream.infrared, 1, stream["width"], stream["height"], rs.format.y8, stream["fps"])
+                config.enable_stream(rs.stream.color, stream["width"], stream["height"], rs.format.bgr8, stream["fps"])
+                profile = self.pipeline.start(config)
+            except Exception:
+                # fallback
+                config = rs.config()
+                config.enable_device(serial_number)
+                config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
+                config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
+                config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 15)
+                profile = self.pipeline.start(config)
+
+            # apply advanced mode + sensor config
+            device = profile.get_device()
+            try:
+                self.advnc_mode = rs.rs400_advanced_mode(device)
+            except Exception:
+                self.advnc_mode = None
+
+            # build post-start filters (your original behavior)
+            if isinstance(self.filter, dict) and self.filter.get("decimate", None) is not None:
+                self.decimate = rs.decimation_filter()
+                self.decimate.set_option(rs.option.filter_magnitude, self.filter["decimate"])
+                self.depth_to_disparity = rs.disparity_transform(True)
+                self.disparity_to_depth = rs.disparity_transform(False)
+
+            if isinstance(self.filter, dict) and self.filter.get("spatial", None) is not None:
+                self.spatial = rs.spatial_filter()
+                self.spatial.set_option(rs.option.filter_magnitude, self.filter["spatial"][0])
+                self.spatial.set_option(rs.option.filter_smooth_alpha, self.filter["spatial"][1])
+                self.spatial.set_option(rs.option.filter_smooth_delta, self.filter["spatial"][2])
+
+            if isinstance(self.filter, dict) and self.filter.get("temporal", None) is not None:
+                self.temporal = rs.temporal_filter()
+                self.temporal.set_option(rs.option.filter_smooth_alpha, self.filter["temporal"][0])
+                self.temporal.set_option(rs.option.filter_smooth_delta, self.filter["temporal"][1])
+
+            if isinstance(self.filter, dict) and self.filter.get("hole_filling", None) is not None:
+                self.hole_filling = rs.hole_filling_filter()
+                self.hole_filling.set_option(rs.option.holes_fill, self.filter["hole_filling"])
+
+            # global time and exposure
+            try:
+                self.sensor_dep = device.first_depth_sensor()
+                self.sensor_dep.set_option(rs.option.global_time_enabled, 1)
+                if exposure:
+                    self.set_exposure(exposure)
+            except Exception:
+                pass
+
+            # optional override intrinsics
+            self.intr = None
+            if K is not None and D is not None:
+                K_ = np.array(K)
+                D_ = np.array(D)
+                sx = 1.0
+                sy = 1.0
+                if native_res is not None:
+                    sx = stream["width"] / native_res[0]
+                    sy = stream["height"] / native_res[1]
+
+                intr = rs.intrinsics()
+                intr.width  = stream["width"]
+                intr.height = stream["height"]
+                intr.ppx    = float(K_[0, 2]) * sx
+                intr.ppy    = float(K_[1, 2]) * sy
+                intr.fx     = float(K_[0, 0]) * sx
+                intr.fy     = float(K_[1, 1]) * sy
+                intr.model  = rs.distortion.brown_conrady
+                intr.coeffs = [float(D_[0]), float(D_[1]), float(D_[2]), float(D_[3]), float(D_[4])]
+                self.intr = intr
+
+            return profile
+
+        last_ex = None
+
+        for attempt in range(1, max_tries + 1):
+            try:
+                # ensure device present each attempt (after resets it can disappear briefly)
+                if not self._wait_for_device(serial_number, timeout=device_wait_sec):
+                    raise RuntimeError(f"Device disappeared (serial={serial_number}).")
+
+                profile = _start_pipeline_once()
+
+                if start:
+                    # warm “sanity check” frame read (ensures streams are alive)
+                    self.get_all()
+                return True
+
+            except Exception as ex:
+                last_ex = ex
+                # stop anything partially started
+                self._stop_pipeline_quiet()
+
+                if not recover_on_fail or attempt >= max_tries:
+                    break
+
+                # Recovery ladder (precise, deterministic):
+                # attempt 1 failure -> hw reset
+                # attempt 2 failure -> usb unbind/bind (Linux)
+                try:
+                    if attempt == 1:
+                        # 1) firmware reset
+                        try:
+                            self._hw_reset()
+                        except Exception:
+                            pass
+                        time.sleep(5.0)
+                    else:
+                        # 2) USB reset (Linux only; may require sudoers/udev)
+                        try:
+                            self._refresh_devices()
+                            # re-resolve usb_port just in case
+                            self.usb_port = None
+                            for d in self.all_device():
+                                if d["serial_number"] == serial_number:
+                                    self.usb_port = d.get("usb_port", None)
+                                    break
+                        except Exception:
+                            pass
+
+                        try:
+                            self._usb_unbind_bind()
+                        except Exception:
+                            pass
+                        time.sleep(3.0)
+
+                    # refresh after recovery
+                    try:
+                        self._refresh_devices()
+                    except Exception:
+                        pass
+
+                except Exception:
+                    # never crash recovery path
+                    pass
+
+        # failure path
+        if raise_on_fail:
+            raise RuntimeError(f"Failed to connect RealSense (serial={serial_number}). Last error: {last_ex}")
+        return False
+
+
+
     #filter={"spatial":[2, 0.5, 20], "temporal":[0.1, 40], "hole_filling":1}
-    def connect(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, native_res=None, start=True):
+    def connect_old(self, serial_number="", mode="bgrd", filter={}, exposure=None, stream={"width":848, "height":480, "fps":15}, K=None, D=None, native_res=None, start=True):
         # filter
         self.filter = filter
         # --- store params for recovery ---
