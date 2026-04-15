@@ -280,7 +280,6 @@ class Camera(Helper):
                     "serial_number": device.get_info(rs.camera_info.serial_number), 
                     "usb_type": device.get_info(rs.camera_info.usb_type_descriptor), 
                     "usb_port": device.get_info(rs.camera_info.physical_port),
-                    "manufacturer": "intel", 
                     "obj": device
                 } for device in devices])
 
