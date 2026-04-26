@@ -262,39 +262,72 @@ class Helper(object):
         print("clicked: ", (int(x), int(y)))
 
 
+# ── Module-level singleton context + hotplug bookkeeping ──────────────
+# librealsense recommends one rs.context() per process for long-running apps.
+# Re-creating a context on every enumeration causes USB hotplug subscription
+# thrashing — on Raspberry Pi this can stall an active pipeline and cause
+# `wait_for_frames` timeouts. Subscribing once and letting librealsense fire
+# a callback whenever USB devices are added/removed keeps the cached
+# `rs._all_device` list current automatically — no polling, no manual refresh.
+_RS_LOCK = threading.Lock()
+
+
+def _rs_device_dict(device):
+    return {
+        "name":          device.get_info(rs.camera_info.name),
+        "serial_number": device.get_info(rs.camera_info.serial_number),
+        "usb_type":      device.get_info(rs.camera_info.usb_type_descriptor),
+        "usb_port":      device.get_info(rs.camera_info.physical_port),
+        "obj":           device,
+    }
+
+
+def _rs_repopulate_locked():
+    """Caller must hold _RS_LOCK."""
+    rs._all_device = [_rs_device_dict(d) for d in rs._ctx.query_devices()]
+
+
+def _rs_on_devices_changed(_info):
+    """Fires on the librealsense internal thread when USB devices change."""
+    with _RS_LOCK:
+        try:
+            _rs_repopulate_locked()
+        except Exception:
+            pass
+
+
+def _rs_ensure_context():
+    """Lazy-create the singleton context + initial population + subscription."""
+    if not hasattr(rs, "_ctx"):
+        rs._ctx = rs.context()
+        with _RS_LOCK:
+            try:
+                _rs_repopulate_locked()
+            except Exception:
+                rs._all_device = []
+        try:
+            rs._ctx.set_devices_changed_callback(_rs_on_devices_changed)
+        except Exception:
+            # Older librealsense builds may not expose this — fall back to
+            # whatever initial population we already did. _refresh_devices()
+            # remains available as a manual override.
+            pass
+
+
 class Camera(Helper):
     """docstring for ClassName"""
     def __init__(self):
         super(Camera, self).__init__()
-
-        # all devices
-        if not hasattr(rs, '_all_device'):
-            # Create a context object
-            ctx = rs.context()
-    
-            # Get a list of all connected devices
-            devices = ctx.query_devices()
-            
-            rs._all_device = list([{
-                    "name": device.get_info(rs.camera_info.name),
-                    "serial_number": device.get_info(rs.camera_info.serial_number), 
-                    "usb_type": device.get_info(rs.camera_info.usb_type_descriptor), 
-                    "usb_port": device.get_info(rs.camera_info.physical_port),
-                    "obj": device
-                } for device in devices])
+        _rs_ensure_context()
 
 
     def _refresh_devices(self):
-        """Refresh cached device list (important after reset / replug)."""
-        ctx = rs.context()
-        devices = ctx.query_devices()
-        rs._all_device = list([{
-            "name": device.get_info(rs.camera_info.name),
-            "serial_number": device.get_info(rs.camera_info.serial_number),
-            "usb_type": device.get_info(rs.camera_info.usb_type_descriptor),
-            "usb_port": device.get_info(rs.camera_info.physical_port),
-            "obj": device
-        } for device in devices])
+        """Force-refresh the cached device list (rarely needed; the hotplug
+        callback set up at first instantiation keeps `rs._all_device` current
+        on its own)."""
+        _rs_ensure_context()
+        with _RS_LOCK:
+            _rs_repopulate_locked()
         return rs._all_device
 
     def _wait_for_device(self, serial_number: str, timeout: float = 10.0, sleep: float = 0.25) -> bool:
@@ -324,9 +357,11 @@ class Camera(Helper):
         return p.returncode, p.stdout
 
     def _hw_reset(self):
-        # firmware reset by serial (only affects this camera)
-        ctx = rs.context()
-        for dev in ctx.query_devices():
+        # firmware reset by serial (only affects this camera).
+        # Reuse the singleton context — creating a fresh one here would
+        # churn the USB hotplug subscription.
+        _rs_ensure_context()
+        for dev in rs._ctx.query_devices():
             if dev.get_info(rs.camera_info.serial_number) == self.serial_number:
                 dev.hardware_reset()
                 return True
