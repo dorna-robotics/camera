@@ -1,8 +1,12 @@
 import setuptools
-import camera as pkg
+import re
+from pathlib import Path
 
-# Read the version from the dorna_vision package
-version = pkg.__version__
+# Read __version__ from camera/__init__.py without importing the package,
+# so `pip install` works even before runtime deps (pyrealsense2, opencv) are
+# present in the build environment.
+_init_text = (Path(__file__).parent / "camera" / "__init__.py").read_text()
+version = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _init_text).group(1)
 
 
 with open("README.md", "r") as fh:
