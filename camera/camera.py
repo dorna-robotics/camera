@@ -288,12 +288,71 @@ def _rs_repopulate_locked():
 
 
 def _rs_on_devices_changed(_info):
-    """Fires on the librealsense internal thread when USB devices change."""
+    """Fires on the librealsense internal thread when USB devices change.
+
+    In addition to refreshing the cached device list, walks the registered
+    Camera instances and emits Device-protocol state transitions:
+      USB drop  → set_state("down")    on cameras whose serial vanished.
+      USB back  → set_state("recovering") on cameras whose serial returned.
+                  Pipeline rebuild itself happens lazily on the next
+                  `frame()` call via the existing self-healing path; the
+                  state simply reflects "USB is back, ready to retry."
+    """
     with _RS_LOCK:
         try:
             _rs_repopulate_locked()
         except Exception:
             pass
+    # Notify registered cameras outside the rs lock; snapshot under the
+    # camera-registry lock and fire callbacks unlocked so a slow listener
+    # can't block librealsense's internal thread.
+    try:
+        current_sns = {d["serial_number"] for d in rs._all_device}
+    except Exception:
+        current_sns = set()
+    with _RS_CAM_LOCK:
+        cams = list(_RS_CAM_BY_SN.values())
+    for cam in cams:
+        try:
+            sn = getattr(cam, "serial_number", None)
+            if not sn:
+                continue
+            if sn in current_sns:
+                if getattr(cam, "state", "ok") == "down":
+                    cam._set_state("recovering", "USB reconnected")
+            else:
+                if getattr(cam, "state", "ok") == "ok":
+                    cam._set_state("down", "USB disconnected")
+        except Exception:
+            pass
+
+
+# Registered Camera instances keyed by serial number so the module-level
+# hotplug callback can find them. Last-write-wins on duplicate serials
+# (rare — would mean two Camera objects bound to the same physical
+# device, which we don't support).
+_RS_CAM_BY_SN = {}
+_RS_CAM_LOCK = threading.Lock()
+
+
+def _rs_register_camera(cam):
+    sn = getattr(cam, "serial_number", None)
+    if not sn:
+        return
+    with _RS_CAM_LOCK:
+        _RS_CAM_BY_SN[sn] = cam
+
+
+def _rs_unregister_camera(cam):
+    sn = getattr(cam, "serial_number", None)
+    if not sn:
+        return
+    with _RS_CAM_LOCK:
+        # Identity guard: only remove if this is still the registered
+        # instance — otherwise a re-register from connect() during
+        # recovery could be undone by a stale close() on the old object.
+        if _RS_CAM_BY_SN.get(sn) is cam:
+            _RS_CAM_BY_SN.pop(sn, None)
 
 
 def _rs_ensure_context():
@@ -315,11 +374,80 @@ def _rs_ensure_context():
 
 
 class Camera(Helper):
-    """docstring for ClassName"""
+    """docstring for ClassName
+
+    Camera also structurally satisfies the workspace.devices.Device
+    Protocol — it exposes `id` / `state` / `msg` / `on_state_change` /
+    `recover` / `release` so the orchestrator's HealthBus can register
+    and monitor it without Camera importing workspace. Pure structural
+    typing; no inheritance from any base class.
+    """
     def __init__(self):
         super(Camera, self).__init__()
         _rs_ensure_context()
 
+        # Device-protocol attributes. A freshly-constructed Camera has
+        # no device attached yet, so the honest initial state is "down".
+        # connect() success transitions "down" → "ok", which is a real
+        # transition and fires listeners (the in-place "ok" → "ok" case
+        # is a no-op by design — listeners only see real changes).
+        self.serial_number = None
+        self.state = "down"          # "ok" | "down" | "recovering"
+        self.msg = "not connected"
+        self._listeners = []
+        self._listeners_lock = threading.Lock()
+
+    # ── Device protocol ──────────────────────────────────────────────
+
+    @property
+    def id(self):
+        """Stable device identifier — the USB serial number."""
+        return self.serial_number
+
+    def on_state_change(self, callback):
+        """Register a state-transition listener.
+        callback signature: callback(new_state: str, msg: str) -> None
+        """
+        with self._listeners_lock:
+            self._listeners.append(callback)
+
+    def _set_state(self, new_state, msg=""):
+        """Update state and fan out to listeners. No-op if state didn't
+        change — listeners only see real transitions, not redundant
+        re-emits. Listeners fire OUTSIDE the lock so a slow subscriber
+        can't block whichever thread triggered the transition."""
+        if self.state == new_state:
+            return
+        self.state = new_state
+        self.msg = str(msg or "")
+        with self._listeners_lock:
+            cbs = list(self._listeners)
+        for cb in cbs:
+            try:
+                cb(new_state, self.msg)
+            except Exception:
+                pass
+
+    def recover(self):
+        """Public recovery entry point used by the Device protocol.
+        Wraps the existing _recover() with state events so listeners
+        learn that a recovery cycle started, succeeded, or failed.
+        """
+        self._set_state("recovering", "rebuilding pipeline")
+        try:
+            ok = bool(self._recover())
+        except Exception as ex:
+            self._set_state("down", f"recovery failed: {ex}")
+            return False
+        self._set_state("ok" if ok else "down",
+                        "" if ok else "recovery failed")
+        return ok
+
+    def release(self):
+        """Device-protocol method — alias for close()."""
+        return self.close()
+
+    # ── Internals ────────────────────────────────────────────────────
 
     def _refresh_devices(self):
         """Force-refresh the cached device list (rarely needed; the hotplug
@@ -448,16 +576,34 @@ class Camera(Helper):
         return np.array(depth_int.coeffs)
 
 
-    def frame(self, align_to, time_out=5):
-        # self-healing wait_for_frames
+    def frame(self, align_to, time_out=2):
+        # Frame fetch is the single source of truth for "is the camera
+        # healthy": did pyrealsense give us a frame? If yes → ok. If
+        # no → down AND raise so the caller catches it, the orchestrator
+        # pauses, and the user is prompted to fix it.
+        #
+        # Pre-check: pyrealsense's wait_for_frames doesn't honor its
+        # timeout reliably when USB has dropped — the call can hang
+        # indefinitely on a disconnected pipeline. The hotplug callback
+        # has already told us the device is gone, so raise immediately
+        # rather than block on a known-broken pipeline.
+        if self.state == "down":
+            raise RuntimeError(f"camera is down: {self.msg or 'unknown'}")
+
         try:
             frames = self.pipeline.wait_for_frames(1000 * time_out)
-        except RuntimeError:
-            if not self._recover():
-                raise
-            # retry once after recover
-            print("Recovery successful, retrying frame capture...")
-            frames = self.pipeline.wait_for_frames(1000 * time_out)
+        except Exception as ex:
+            self._set_state("down", f"frame fetch failed: {ex}")
+            raise
+
+        # Success — frames came through. We only clear state when it
+        # was "recovering" (i.e. USB came back via hotplug AND we just
+        # confirmed frames are flowing). "down" stays sticky until
+        # explicit recover() — pyrealsense buffers frames internally,
+        # so a single successful wait_for_frames doesn't prove the
+        # device is actually working, just that the buffer wasn't empty.
+        if self.state == "recovering":
+            self._set_state("ok", "")
 
         # Create an align object
         align = rs.align(align_to)
@@ -673,8 +819,19 @@ class Camera(Helper):
                 profile = _start_pipeline_once()
 
                 if start:
-                    # warm “sanity check” frame read (ensures streams are alive)
-                    self.get_all()
+                    # Warm "sanity check" frame read (ensures streams are
+                    # alive). Bypass our own get_all/frame so the down-gate
+                    # doesn't block — initial state is "down" since the
+                    # device wasn't connected yet, but we're literally
+                    # in the act of connecting now. Call pyrealsense
+                    # directly; if it raises, the outer retry loop catches
+                    # and reattempts.
+                    self.pipeline.wait_for_frames(2000)
+                # Device-protocol: register for hotplug notifications and
+                # transition to "ok". Re-registers cleanly on _recover()
+                # paths since connect() runs there too.
+                _rs_register_camera(self)
+                self._set_state("ok", "")
                 return True
 
             except Exception as ex:
@@ -903,6 +1060,10 @@ class Camera(Helper):
             self.pipeline.stop()
         except:
             pass
+        # Stop receiving hotplug notifications for this instance.
+        # Deliberate close, not a fault — no state event fired; the
+        # caller already knows the device is gone.
+        _rs_unregister_camera(self)
         return True
 
 
