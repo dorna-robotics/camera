@@ -318,8 +318,14 @@ def _rs_on_devices_changed(_info):
             if not sn:
                 continue
             if sn in current_sns:
+                # USB is back. Stay "down" — only an explicit recover() call
+                # rebuilds the pipeline. We refresh the msg so subscribers
+                # learn USB is plugged in again and can prompt the operator
+                # to click Recover. State stays "down" so the Recover button
+                # remains clickable; using "recovering" here would imply an
+                # actual recovery is in progress, which it isn't.
                 if getattr(cam, "state", "ok") == "down":
-                    cam._set_state("recovering", "USB reconnected")
+                    cam._set_state("down", "USB reconnected")
             else:
                 if getattr(cam, "state", "ok") == "ok":
                     cam._set_state("down", "USB disconnected")
@@ -412,14 +418,17 @@ class Camera(Helper):
             self._listeners.append(callback)
 
     def _set_state(self, new_state, msg=""):
-        """Update state and fan out to listeners. No-op if state didn't
-        change — listeners only see real transitions, not redundant
-        re-emits. Listeners fire OUTSIDE the lock so a slow subscriber
-        can't block whichever thread triggered the transition."""
-        if self.state == new_state:
+        """Update state and fan out to listeners. No-op when *both* state and
+        msg are unchanged — listeners only see real updates. Same-state with
+        a new msg DOES fire (so e.g. "down (USB disconnected)" can transition
+        to "down (USB reconnected)" and downstream UIs learn about it).
+        Listeners fire OUTSIDE the lock so a slow subscriber can't block
+        whichever thread triggered the update."""
+        new_msg = str(msg or "")
+        if self.state == new_state and self.msg == new_msg:
             return
         self.state = new_state
-        self.msg = str(msg or "")
+        self.msg = new_msg
         with self._listeners_lock:
             cbs = list(self._listeners)
         for cb in cbs:
@@ -432,16 +441,51 @@ class Camera(Helper):
         """Public recovery entry point used by the Device protocol.
         Wraps the existing _recover() with state events so listeners
         learn that a recovery cycle started, succeeded, or failed.
+
+        Fast-fails when the device isn't on the USB bus at all —
+        without this, the full recovery ladder (firmware reset → USB
+        unbind/bind → retries) grinds for ~3 minutes before giving up,
+        which is pointless when there's literally nothing to recover.
+
+        Recovery is only declared successful if a real frame fetch
+        succeeds — `_recover()` may report True from a "started but not
+        streaming" pipeline (e.g. when the USB is still missing), so an
+        end-to-end verification is required to honor the Device-protocol
+        contract that ``state == "ok"`` means data is flowing.
         """
         self._set_state("recovering", "rebuilding pipeline")
+        # Fast-fail if the device isn't enumerated. The hotplug callback
+        # keeps rs._all_device current, so we don't even need a wait loop.
+        try:
+            devs = self._refresh_devices()
+        except Exception:
+            devs = []
+        if self.serial_number and not any(
+            d.get("serial_number") == self.serial_number for d in devs
+        ):
+            self._set_state(
+                "down",
+                "device not detected on USB bus — reconnect the cable and retry",
+            )
+            return False
         try:
             ok = bool(self._recover())
         except Exception as ex:
             self._set_state("down", f"recovery failed: {ex}")
             return False
-        self._set_state("ok" if ok else "down",
-                        "" if ok else "recovery failed")
-        return ok
+        if not ok:
+            self._set_state("down", "recovery failed")
+            return False
+        # End-to-end verification: fetch a real frame. If the pipeline
+        # came back broken (stream not started, etc.), frame() raises
+        # and self._set_state already moved us to "down".
+        try:
+            self.frame(rs.stream.color, time_out=2)
+        except Exception:
+            # frame() already set state to "down" with a precise msg.
+            return False
+        self._set_state("ok", "")
+        return True
 
     def release(self):
         """Device-protocol method — alias for close()."""
@@ -524,9 +568,11 @@ class Camera(Helper):
             pass
         time.sleep(5)
 
-        # reconnect (no recursion: start=False)
+        # reconnect (no recursion: start=False).
+        # connect() returns False on failure when raise_on_fail=False (default);
+        # we MUST check the return value, otherwise recovery silently lies.
         try:
-            self.connect(
+            if self.connect(
                 serial_number=self.serial_number,
                 mode=self.mode,
                 filter=self.filter,
@@ -536,15 +582,15 @@ class Camera(Helper):
                 D=self.D,
                 native_res=self.native_res,
                 start=False
-            )
-            return True
+            ):
+                return True
         except:
             pass
 
         # 2) escalate: USB unbind/bind then reconnect
         try:
             if self._usb_unbind_bind():
-                self.connect(
+                if self.connect(
                     serial_number=self.serial_number,
                     mode=self.mode,
                     filter=self.filter,
@@ -554,8 +600,8 @@ class Camera(Helper):
                     D=self.D,
                     native_res=self.native_res,
                     start=False
-                )
-                return True
+                ):
+                    return True
         except:
             pass
 
