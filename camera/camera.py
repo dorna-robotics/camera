@@ -416,6 +416,14 @@ class Camera(Helper):
         # AutoRecover loop without string-matching on msg. Camera itself
         # does not retry — it just emits the event.
         self._available_listeners = []
+        # Frame-freshness baseline. ``-1`` is the "no baseline" sentinel:
+        # the next frame establishes the reference. Reset to -1 whenever
+        # the pipeline is disrupted (state leaves "ok") so a rebuilt
+        # pipeline doesn't get compared against numbers/timestamps from
+        # the previous one. See ``_validate_freshness``.
+        self._last_frame_number = -1
+        self._last_frame_ts = 0.0
+        self._last_wall_ts = 0.0
 
     # ── Device protocol ──────────────────────────────────────────────
 
@@ -451,6 +459,13 @@ class Camera(Helper):
         new_msg = str(msg or "")
         if self.state == new_state and self.msg == new_msg:
             return
+        # Pipeline-disruption clears the freshness baseline so the next
+        # "ok" frame establishes a fresh reference instead of comparing
+        # against numbers/timestamps from a since-restarted pipeline.
+        if new_state != "ok":
+            self._last_frame_number = -1
+            self._last_frame_ts = 0.0
+            self._last_wall_ts = 0.0
         self.state = new_state
         self.msg = new_msg
         with self._listeners_lock:
@@ -516,6 +531,78 @@ class Camera(Helper):
         return self.close()
 
     # ── Internals ────────────────────────────────────────────────────
+
+    def _validate_freshness(self, frames):
+        """Confirm ``frames`` is fresh device data, not a buffer replay.
+
+        Three layered checks against the per-camera baseline:
+          1. **Frame number monotonicity.** Every frame from the device
+             carries a strictly-increasing counter. Same number twice =
+             buffer is replaying = hardware frozen.
+          2. **Device-clock advancement.** The on-device timestamp
+             (milliseconds) must advance with every frame. A stuck
+             device clock means the sensor stalled even if the buffer
+             is somehow handing out distinct objects.
+          3. **Wall-clock vs device-clock drift.** Over a window of
+             ≥ 2 s wall time, the device clock must advance at least
+             1 s. Catches sustained underclocking (thermal throttle,
+             USB starvation) where checks 1 and 2 pass per-frame but
+             the device is silently falling behind real time.
+
+        All three checks are **FPS-independent**: thresholds compare
+        the device's hardware clock against the wall clock, both ticking
+        at 1 Hz in real time regardless of how many frames per second
+        the stream is configured for. Works the same at 1 fps or 90 fps.
+
+        The first frame after any pipeline disruption (state leaving
+        "ok" — connect, recover, USB unplug) carries no baseline; this
+        method initializes one and returns. ``_set_state`` resets the
+        baseline to ``-1`` whenever it transitions away from "ok".
+
+        Cost: three integer/float comparisons per frame. Effect: every
+        caller of ``get_all`` / ``frame`` gets stale-frame protection
+        for free, without touching the call site.
+        """
+        fn = frames.get_frame_number()
+        ts = frames.get_timestamp()       # device clock, ms
+        now = time.time()
+
+        # First frame since the pipeline last became healthy — establish
+        # baseline. -1 sentinel ensures we don't compare a fresh post-
+        # restart frame against pre-restart numbers.
+        if self._last_frame_number < 0:
+            self._last_frame_number = fn
+            self._last_frame_ts = ts
+            self._last_wall_ts = now
+            return
+
+        # 1. Frame number must strictly advance.
+        if fn <= self._last_frame_number:
+            raise RuntimeError(
+                f"frame_number {fn} not after {self._last_frame_number} — "
+                f"buffer replaying or hardware frozen"
+            )
+
+        # 2. Device clock must strictly advance.
+        if ts <= self._last_frame_ts:
+            raise RuntimeError(
+                f"device timestamp {ts:.0f}ms not after {self._last_frame_ts:.0f}ms — "
+                f"sensor stalled"
+            )
+
+        # 3. Device clock must roughly track wall clock over time.
+        wall_dt = now - self._last_wall_ts
+        device_dt = (ts - self._last_frame_ts) / 1000.0
+        if wall_dt > 2.0 and device_dt < 1.0:
+            raise RuntimeError(
+                f"device advanced only {device_dt:.2f}s while wall advanced "
+                f"{wall_dt:.2f}s — replaying old frames"
+            )
+
+        # Fresh — update baseline.
+        self._last_frame_number = fn
+        self._last_frame_ts = ts
+        self._last_wall_ts = now
 
     def _refresh_devices(self):
         """Force-refresh the cached device list (rarely needed; the hotplug
@@ -664,6 +751,17 @@ class Camera(Helper):
             frames = self.pipeline.wait_for_frames(1000 * time_out)
         except Exception as ex:
             self._set_state("down", f"frame fetch failed: {ex}")
+            raise
+
+        # Frame-freshness validation. wait_for_frames can return a stale
+        # buffered frame when the hardware has frozen mid-stream — same
+        # frame number / same device timestamp, the pipeline doesn't
+        # know any better. We refuse to hand out a stale frame: callers
+        # MUST receive fresh data or a clear error.
+        try:
+            self._validate_freshness(frames)
+        except Exception as ex:
+            self._set_state("down", f"stale frame: {ex}")
             raise
 
         # Success — frames came through. We only clear state when it
