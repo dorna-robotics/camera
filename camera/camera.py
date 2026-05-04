@@ -318,14 +318,23 @@ def _rs_on_devices_changed(_info):
             if not sn:
                 continue
             if sn in current_sns:
-                # USB is back. Stay "down" — only an explicit recover() call
-                # rebuilds the pipeline. We refresh the msg so subscribers
-                # learn USB is plugged in again and can prompt the operator
-                # to click Recover. State stays "down" so the Recover button
-                # remains clickable; using "recovering" here would imply an
-                # actual recovery is in progress, which it isn't.
+                # USB is back. Refresh msg so subscribers learn it's
+                # plugged in again, then fire on_hardware_available
+                # listeners so a service-layer AutoRecover can kick off
+                # a reconnect attempt automatically. The Camera itself
+                # never retries — it just emits the signal.
                 if getattr(cam, "state", "ok") == "down":
                     cam._set_state("down", "USB reconnected")
+                    try:
+                        with cam._listeners_lock:
+                            avail_cbs = list(cam._available_listeners)
+                    except Exception:
+                        avail_cbs = []
+                    for cb in avail_cbs:
+                        try:
+                            cb()
+                        except Exception:
+                            pass
             else:
                 if getattr(cam, "state", "ok") == "ok":
                     cam._set_state("down", "USB disconnected")
@@ -402,6 +411,11 @@ class Camera(Helper):
         self.msg = "not connected"
         self._listeners = []
         self._listeners_lock = threading.Lock()
+        # Listeners fired when the hotplug callback notices our USB came
+        # back. Used by the service layer (CameraPool) to nudge an
+        # AutoRecover loop without string-matching on msg. Camera itself
+        # does not retry — it just emits the event.
+        self._available_listeners = []
 
     # ── Device protocol ──────────────────────────────────────────────
 
@@ -416,6 +430,16 @@ class Camera(Helper):
         """
         with self._listeners_lock:
             self._listeners.append(callback)
+
+    def on_hardware_available(self, callback):
+        """Register a callback fired when hotplug detects this camera's USB
+        re-appeared on the bus while we were down. Service layers use this
+        to drive auto-recovery. callback signature: ``callback() -> None``.
+        Fired on librealsense's notification thread — keep it cheap; do
+        the actual work on a worker thread.
+        """
+        with self._listeners_lock:
+            self._available_listeners.append(callback)
 
     def _set_state(self, new_state, msg=""):
         """Update state and fan out to listeners. No-op when *both* state and
