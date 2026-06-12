@@ -11,7 +11,7 @@ from camera import Camera
 # ── config ───────────────────────────────────────────────────────────
 STREAM   = {"width": 1280, "height": 720, "fps": 30}
 CHANNELS = ("color", "depth")
-LOG_PATH = os.environ.get("STRESS_LOG", "stress_5m.log")
+LOG_PATH = os.environ.get("STRESS_LOG", "stress.log")
 REPORT_EVERY_SEC = 5.0          # how often to write a status line
 FRAME_TIMEOUT_SEC = 2           # per-frame wait_for_frames timeout
 # ─────────────────────────────────────────────────────────────────────
