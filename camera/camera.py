@@ -409,6 +409,9 @@ class Camera(Helper):
         self.serial_number = None
         self.state = "down"          # "ok" | "down" | "recovering"
         self.msg = "not connected"
+        # Default channel set — connect() overwrites this. Pre-set so the
+        # frame() helpers have a sane fallback if queried before connect.
+        self._enabled_channels = {"color", "depth"}
         self._listeners = []
         self._listeners_lock = threading.Lock()
         # Listeners fired when the hotplug callback notices our USB came
@@ -692,7 +695,8 @@ class Camera(Helper):
                 K=self.K,
                 D=self.D,
                 native_res=self.native_res,
-                start=False
+                start=False,
+                channels=tuple(getattr(self, "_enabled_channels", ("color", "depth"))),
             ):
                 return True
         except:
@@ -733,7 +737,33 @@ class Camera(Helper):
         return np.array(depth_int.coeffs)
 
 
-    def frame(self, align_to, time_out=2):
+    def _validate_align_to(self, align_to):
+        """Validate that the requested align target is one of the channels we
+        subscribed to. Raises ValueError if not — no silent fallback. The
+        caller asked for a specific frame to align into; if it isn't there,
+        the right thing is to fail loudly so they fix the call site rather
+        than receive frames in an unexpected coordinate space."""
+        enabled = self._enabled_channels
+        name = {
+            rs.stream.color: "color",
+            rs.stream.depth: "depth",
+            rs.stream.infrared: "ir_left",
+        }.get(align_to)
+        if name is None:
+            raise ValueError(
+                f"align_to={align_to!r} is not a supported stream "
+                "(expected rs.stream.color, rs.stream.depth, or rs.stream.infrared)"
+            )
+        if name not in enabled:
+            raise ValueError(
+                f"align_to=rs.stream.{name} requested but that channel is not "
+                f"enabled. Enabled channels: {sorted(enabled)}. "
+                "Pass channels=(...) to connect() to subscribe, or align to color "
+                "(the default)."
+            )
+        return align_to
+
+    def frame(self, align_to=rs.stream.color, time_out=2):
         # Frame fetch is the single source of truth for "is the camera
         # healthy": did pyrealsense give us a frame? If yes → ok. If
         # no → down AND raise so the caller catches it, the orchestrator
@@ -773,32 +803,41 @@ class Camera(Helper):
         if self.state == "recovering":
             self._set_state("ok", "")
 
+        # Validate align target — raises if the requested stream isn't
+        # enabled. No silent fallback: callers should pass a target that
+        # matches their channel subscription, or rely on the color default.
+        align_to = self._validate_align_to(align_to)
+
         # Create an align object
         align = rs.align(align_to)
 
-        # Align the depth frame to ir frame
+        # Align frames to the chosen target
         aligned_frames = align.process(frames)
 
-        # frames
-        depth_frame = aligned_frames.get_depth_frame()
-        ir_frame = aligned_frames.get_infrared_frame()
-        color_frame = aligned_frames.get_color_frame()
+        # Frames — only fetch the ones we actually enabled. Disabled
+        # streams return None so callers can keep the 4-tuple shape
+        # without crashing on missing data.
+        enabled = self._enabled_channels
+        depth_frame = aligned_frames.get_depth_frame() if "depth" in enabled else None
+        ir_frame = aligned_frames.get_infrared_frame() if "ir_left" in enabled else None
+        color_frame = aligned_frames.get_color_frame() if "color" in enabled else None
 
-        # filters
-        if self.decimate:
-            depth_frame = self.decimate.process(depth_frame)
-        if self.depth_to_disparity:
-            depth_frame = self.depth_to_disparity.process(depth_frame)
-        if self.spatial:
-            depth_frame = self.spatial.process(depth_frame)
-        if self.temporal:
-            depth_frame = self.temporal.process(depth_frame)
-        if self.disparity_to_depth:
-            depth_frame = self.disparity_to_depth.process(depth_frame)
-        if self.hole_filling:
-            depth_frame = self.hole_filling.process(depth_frame)
+        # Depth filters only run when we actually have depth.
+        if depth_frame is not None:
+            if self.decimate:
+                depth_frame = self.decimate.process(depth_frame)
+            if self.depth_to_disparity:
+                depth_frame = self.depth_to_disparity.process(depth_frame)
+            if self.spatial:
+                depth_frame = self.spatial.process(depth_frame)
+            if self.temporal:
+                depth_frame = self.temporal.process(depth_frame)
+            if self.disparity_to_depth:
+                depth_frame = self.disparity_to_depth.process(depth_frame)
+            if self.hole_filling:
+                depth_frame = self.hole_filling.process(depth_frame)
 
-        depth_frame = depth_frame.as_depth_frame()
+            depth_frame = depth_frame.as_depth_frame()
 
         return depth_frame, ir_frame, color_frame, frames
 
@@ -814,7 +853,7 @@ class Camera(Helper):
         mode="bgrd",
         filter={},
         exposure=None,
-        stream={"width":848, "height":480, "fps":15},
+        stream={"width":848, "height":480, "fps":15},  # {"width":1280, "height":720, "fps":30}
         K=None,
         D=None,
         native_res=None,
@@ -823,14 +862,27 @@ class Camera(Helper):
         max_tries=3,
         recover_on_fail=True,
         raise_on_fail=False,
-        device_wait_sec=10.0
+        device_wait_sec=10.0,
+        # which sensors to subscribe to — drop unused ones to free USB bandwidth.
+        # On D405 over a 5m cable, depth+color alone fits 1280@30; adding IR
+        # tips you back over and the link starts dropping frames.
+        channels=("color", "depth"),
     ):
         """
         Production-safe connect:
         - returns True on success
         - returns False on failure (no exception) unless raise_on_fail=True
         - on failure, attempts: hw reset -> usb unbind/bind (Linux) -> retry
+
+        channels: iterable from {"color","depth","ir_left","ir_right"}.
+        Disabled channels make frame()/get_all() return None in their slot
+        — the tuple shape never changes, so existing callsites keep working.
         """
+
+        # Normalize + remember channel subscription. Used by frame() and
+        # _recover() (so retries re-enable the same set).
+        valid_channels = {"color", "depth", "ir_left", "ir_right"}
+        self._enabled_channels = {c for c in channels if c in valid_channels} or {"color", "depth"}
 
         # store params for recovery and later use
         self.filter = filter
@@ -899,19 +951,25 @@ class Camera(Helper):
                 profile = self.pipeline.start(config)
                 return profile
 
-            # normal streams
+            # normal streams — only enable subscribed channels.
+            def _enable_subscribed(cfg, w, h, fps):
+                if "depth" in self._enabled_channels:
+                    cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+                if "ir_left" in self._enabled_channels:
+                    cfg.enable_stream(rs.stream.infrared, 1, w, h, rs.format.y8, fps)
+                if "ir_right" in self._enabled_channels:
+                    cfg.enable_stream(rs.stream.infrared, 2, w, h, rs.format.y8, fps)
+                if "color" in self._enabled_channels:
+                    cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
+
             try:
-                config.enable_stream(rs.stream.depth, stream["width"], stream["height"], rs.format.z16, stream["fps"])
-                config.enable_stream(rs.stream.infrared, 1, stream["width"], stream["height"], rs.format.y8, stream["fps"])
-                config.enable_stream(rs.stream.color, stream["width"], stream["height"], rs.format.bgr8, stream["fps"])
+                _enable_subscribed(config, stream["width"], stream["height"], stream["fps"])
                 profile = self.pipeline.start(config)
             except Exception:
-                # fallback
+                # fallback to a known-safe resolution
                 config = rs.config()
                 config.enable_device(serial_number)
-                config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
-                config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
-                config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 15)
+                _enable_subscribed(config, 640, 480, 15)
                 profile = self.pipeline.start(config)
 
             # apply advanced mode + sensor config
@@ -1238,18 +1296,40 @@ class Camera(Helper):
     """
     get frame, image and depth intrinsic data
     """
-    def get_all(self, align_to=rs.stream.infrared, alpha=0.03): # rs.stream.color
-        # Create an align object
+    def get_all(self, align_to=rs.stream.color, alpha=0.03):
+        # Default aligns to color — the human-visible image, and the
+        # frame self.xyz() implicitly assumes when reading intrinsics
+        # from color_frame.profile. Pass align_to=rs.stream.depth or
+        # rs.stream.infrared explicitly if you need a different target;
+        # the requested stream must be in the channels= subscription
+        # passed to connect(), otherwise frame() raises ValueError.
+        # Disabled channels come back as None so the 9-tuple shape is
+        # preserved and existing callers keep working.
         depth_frame, ir_frame, color_frame, frames = self.frame(align_to)
 
-        depth_img = np.asanyarray(depth_frame.get_data())
-        depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
-        ir_img = np.asanyarray(ir_frame.get_data())
-        color_img = np.asanyarray(color_frame.get_data())
+        if depth_frame is not None:
+            depth_img = np.asanyarray(depth_frame.get_data())
+            depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
+        else:
+            depth_img = None
+        ir_img = np.asanyarray(ir_frame.get_data()) if ir_frame is not None else None
+        color_img = np.asanyarray(color_frame.get_data()) if color_frame is not None else None
+
+        # Intrinsics source — explicit precedence:
+        #   1. user-supplied K/D (self.intr)
+        #   2. color frame (the documented align target; xyz() reads
+        #      intrinsics from color_frame.profile, so this matches)
+        #   3. depth then ir, only as a last resort if color is disabled
         if self.intr is not None:
             depth_int = self.intr
-        else:
+        elif color_frame is not None:
             depth_int = rs.video_stream_profile(color_frame.profile).get_intrinsics()
+        elif depth_frame is not None:
+            depth_int = rs.video_stream_profile(depth_frame.profile).get_intrinsics()
+        elif ir_frame is not None:
+            depth_int = rs.video_stream_profile(ir_frame.profile).get_intrinsics()
+        else:
+            depth_int = None
 
         return depth_frame, ir_frame, color_frame, depth_img, ir_img, color_img, depth_int, frames, frames.get_timestamp()/1000
 
