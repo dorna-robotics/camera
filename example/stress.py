@@ -141,31 +141,67 @@ def main():
     grabs_total = 0
     errors_total = 0
     first_failure_at = None
-    # Freshness aggregates over the current burst:
+    # Freshness aggregates over all bursts:
     freshness_min_ms = None
     freshness_max_ms = None
+    # Clock-offset baseline (device-clock vs wall-clock). Set after the
+    # warm-up burst — librealsense's first frames carry a startup-lag
+    # that pollutes the baseline if measured at burst 1.
+    BASELINE_BURST = 2          # which burst seeds the offset
+    baseline_offset_ms = None   # set after BASELINE_BURST
+    # Frame interval at the configured fps, in ms. Used to compute
+    # gap_ms (jitter above the ideal frame spacing).
+    frame_interval_ms = 1000.0 / STREAM["fps"]
 
-    def log_burst_status(burst_freshness_ms):
-        nonlocal freshness_min_ms, freshness_max_ms
-        avg_ms = (sum(burst_freshness_ms) / len(burst_freshness_ms)
-                  if burst_freshness_ms else float("nan"))
-        max_ms = max(burst_freshness_ms) if burst_freshness_ms else float("nan")
-        # Track all-time freshness extremes.
-        if burst_freshness_ms:
-            bmin, bmax = min(burst_freshness_ms), max(burst_freshness_ms)
+    def log_burst_status(fresh_list, grab_ms_list, gap_ms_list):
+        nonlocal freshness_min_ms, freshness_max_ms, baseline_offset_ms
+
+        def _avg(xs): return sum(xs) / len(xs) if xs else float("nan")
+        def _max(xs): return max(xs) if xs else float("nan")
+
+        fresh_avg = _avg(fresh_list)
+        fresh_max = _max(fresh_list)
+        grab_avg  = _avg(grab_ms_list)
+        grab_max  = _max(grab_ms_list)
+        gap_avg   = _avg(gap_ms_list)
+        gap_max   = _max(gap_ms_list)
+
+        # All-time freshness extremes.
+        if fresh_list:
+            bmin, bmax = min(fresh_list), max(fresh_list)
             freshness_min_ms = bmin if freshness_min_ms is None else min(freshness_min_ms, bmin)
             freshness_max_ms = bmax if freshness_max_ms is None else max(freshness_max_ms, bmax)
+
+        # Seed the clock-offset baseline once, on the warm-up burst.
+        # Median of that burst's freshness is the constant offset between
+        # device clock and wall clock; subsequent bursts subtract it so
+        # fresh_delta reads ~0ms when healthy and grows when stale.
+        if baseline_offset_ms is None and bursts == BASELINE_BURST and fresh_list:
+            sorted_f = sorted(fresh_list)
+            baseline_offset_ms = sorted_f[len(sorted_f) // 2]
+            log.info("clock-offset baseline set: %.1fms (subtracted from "
+                     "fresh_delta in subsequent bursts)", baseline_offset_ms)
+
+        if baseline_offset_ms is not None and fresh_list:
+            fresh_delta_avg = fresh_avg - baseline_offset_ms
+            fresh_delta_max = fresh_max - baseline_offset_ms
+            fresh_delta_str = (f"d_avg={fresh_delta_avg:+6.1f}ms "
+                               f"d_max={fresh_delta_max:+6.1f}ms")
+        else:
+            fresh_delta_str = "d_avg=    n/a d_max=    n/a"
+
         temp = read_pi_temp_c()
         rss_mb, cpu_pct = read_proc_stats()
         log.info(
             "burst=%-5d uptime=%7.1fs  grabs=%-6d errors=%d  "
-            "fresh_avg=%6.1fms fresh_max=%6.1fms  "
-            "alltime_fresh_min=%s alltime_fresh_max=%s  "
+            "fresh_avg=%6.1fms %s  "
+            "grab_avg=%5.1fms grab_max=%5.1fms  "
+            "gap_avg=%+5.1fms gap_max=%+5.1fms  "
             "cpu=%s%%  rss=%s MB  temp=%s°C  state=%s",
             bursts, time.time() - t_start, grabs_total, errors_total,
-            avg_ms, max_ms,
-            "n/a" if freshness_min_ms is None else f"{freshness_min_ms:.1f}ms",
-            "n/a" if freshness_max_ms is None else f"{freshness_max_ms:.1f}ms",
+            fresh_avg, fresh_delta_str,
+            grab_avg, grab_max,
+            gap_avg, gap_max,
             "n/a" if cpu_pct is None else f"{cpu_pct:.1f}",
             "n/a" if rss_mb is None else f"{rss_mb:.1f}",
             "n/a" if temp is None else f"{temp:.1f}",
@@ -176,18 +212,34 @@ def main():
         while not stop["flag"]:
             bursts += 1
             burst_freshness_ms = []
+            burst_grab_ms = []
+            burst_gap_ms = []
+            prev_grab_end = None
             for _ in range(BURST_SIZE):
                 if stop["flag"]:
                     break
                 try:
-                    # get_all returns ..., frames, ts at index [-2], [-1].
-                    # ts is frames.get_timestamp()/1000 = device clock in seconds.
+                    # Wall-clock the get_all() call so we know how long
+                    # each grab blocks the caller — independent of any
+                    # clock-offset confusion. Healthy at 720p on Pi5 is
+                    # roughly the frame interval (~33ms) plus a small
+                    # amount of alignment/copy overhead.
+                    t0 = time.time()
                     result = cam.get_all()
+                    t1 = time.time()
                     grabs_total += 1
+                    grab_ms = (t1 - t0) * 1000.0
+                    burst_grab_ms.append(grab_ms)
+                    # Inter-grab gap above one ideal frame interval. Zero
+                    # is perfect spacing; positive = pipeline lagging.
+                    if prev_grab_end is not None:
+                        gap = (t1 - prev_grab_end) * 1000.0 - frame_interval_ms
+                        burst_gap_ms.append(gap)
+                    prev_grab_end = t1
+                    # Freshness: device-clock timestamp vs wall-clock now.
+                    # Absolute value is noisy because of clock offset;
+                    # fresh_delta in the log line subtracts the baseline.
                     device_ts_sec = result[-1]
-                    # Freshness: how stale is the frame at the moment we
-                    # received it? Compares the device hardware timestamp
-                    # against wall clock right now. Sub-100ms = healthy.
                     fresh_ms = (time.time() - device_ts_sec) * 1000.0
                     burst_freshness_ms.append(fresh_ms)
                 except Exception as ex:
@@ -201,7 +253,7 @@ def main():
                 if INTRA_BURST_SLEEP > 0:
                     time.sleep(INTRA_BURST_SLEEP)
 
-            log_burst_status(burst_freshness_ms)
+            log_burst_status(burst_freshness_ms, burst_grab_ms, burst_gap_ms)
 
             # Idle. Sleep in small chunks so Ctrl-C is responsive.
             t_idle_end = time.time() + BURST_GAP_SEC
