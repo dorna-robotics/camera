@@ -853,7 +853,7 @@ class Camera(Helper):
         mode="bgrd",
         filter={},
         exposure=None,
-        stream={"width":848, "height":480, "fps":15},  # {"width":1280, "height":720, "fps":30}
+        stream={"width":1280, "height":720, "fps":30},  # {"width":848, "height":480, "fps":15}
         K=None,
         D=None,
         native_res=None,
