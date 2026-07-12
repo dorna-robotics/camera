@@ -428,6 +428,18 @@ class Camera(Helper):
         self._last_frame_ts = 0.0
         self._last_wall_ts = 0.0
 
+        # Depth → 8-bit scale for the colorized ``depth_img`` produced by
+        # ``get_all`` (out = depth_mm × depth_alpha, capped at 255, then
+        # COLORMAP_JET). 0.5 spans 0–510 mm at ~2 mm/step — sized for
+        # close-range (D405-class) verification stations where mm-scale
+        # structure must survive quantization. Long-range cameras should
+        # set a smaller value (e.g. 0.06 ≈ 4.25 m span). Changeable at
+        # runtime: ``cam.depth_alpha = x`` takes effect on the next
+        # ``get_all``; per-call ``get_all(alpha=...)`` still overrides.
+        # This constant is a sim-to-real contract: training data must be
+        # encoded with the SAME value the runtime uses.
+        self.depth_alpha = 0.5
+
     # ── Device protocol ──────────────────────────────────────────────
 
     @property
@@ -1296,7 +1308,7 @@ class Camera(Helper):
     """
     get frame, image and depth intrinsic data
     """
-    def get_all(self, align_to=rs.stream.color, alpha=0.03):
+    def get_all(self, align_to=rs.stream.color, alpha=None):
         # Default aligns to color — the human-visible image, and the
         # frame self.xyz() implicitly assumes when reading intrinsics
         # from color_frame.profile. Pass align_to=rs.stream.depth or
@@ -1305,6 +1317,13 @@ class Camera(Helper):
         # passed to connect(), otherwise frame() raises ValueError.
         # Disabled channels come back as None so the 9-tuple shape is
         # preserved and existing callers keep working.
+        #
+        # alpha: depth → 8-bit scale for the colorized depth_img
+        # (out = depth_mm × alpha, capped at 255, then COLORMAP_JET).
+        # None (default) reads ``self.depth_alpha`` — settable at runtime;
+        # see its comment in __init__ for the sim-to-real contract.
+        if alpha is None:
+            alpha = self.depth_alpha
         depth_frame, ir_frame, color_frame, frames = self.frame(align_to)
 
         if depth_frame is not None:
