@@ -430,7 +430,7 @@ class Camera(Helper):
 
         # Depth → 8-bit scale for the colorized ``depth_img`` produced by
         # ``get_all`` (out = depth_mm × depth_alpha, capped at 255, then
-        # COLORMAP_JET). 0.5 spans 0–510 mm at ~2 mm/step — sized for
+        # COLORMAP_TURBO). 0.5 spans 0–510 mm at ~2 mm/step — sized for
         # close-range (D405-class) verification stations where mm-scale
         # structure must survive quantization. Long-range cameras should
         # set a smaller value (e.g. 0.06 ≈ 4.25 m span). Changeable at
@@ -1319,7 +1319,7 @@ class Camera(Helper):
         # preserved and existing callers keep working.
         #
         # alpha: depth → 8-bit scale for the colorized depth_img
-        # (out = depth_mm × alpha, capped at 255, then COLORMAP_JET).
+        # (out = depth_mm × alpha, capped at 255, then COLORMAP_TURBO).
         # None (default) reads ``self.depth_alpha`` — settable at runtime;
         # see its comment in __init__ for the sim-to-real contract.
         if alpha is None:
@@ -1328,7 +1328,7 @@ class Camera(Helper):
 
         if depth_frame is not None:
             depth_img = np.asanyarray(depth_frame.get_data())
-            depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_JET)
+            depth_img = cv2.applyColorMap(cv2.convertScaleAbs(depth_img, alpha=alpha), cv2.COLORMAP_TURBO)
         else:
             depth_img = None
         ir_img = np.asanyarray(ir_frame.get_data()) if ir_frame is not None else None
