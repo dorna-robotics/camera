@@ -807,6 +807,33 @@ class Camera(Helper):
         return np.array(depth_int.coeffs)
 
 
+    def _stream_intrinsics(self, stream="color"):
+        """rs.intrinsics of the ACTIVE profile for ``stream`` ("color" or
+        "depth") — the negotiated stream, not the requested config, so the
+        values match the frames actually delivered (a D405 on a USB 2 link
+        silently drops resolution)."""
+        rs_stream = {"color": rs.stream.color, "depth": rs.stream.depth}.get(stream)
+        if rs_stream is None:
+            raise ValueError(f"stream must be 'color' or 'depth', got {stream!r}")
+        prof = self.pipeline.get_active_profile().get_stream(rs_stream)
+        return rs.video_stream_profile(prof).get_intrinsics()
+
+
+    def get_K(self, stream="color"):
+        """Live intrinsic matrix as plain nested lists (JSON-safe, no numpy):
+        [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] — paste-ready for camera_cfg."""
+        i = self._stream_intrinsics(stream)
+        return [[float(i.fx), 0.0, float(i.ppx)],
+                [0.0, float(i.fy), float(i.ppy)],
+                [0.0, 0.0, 1.0]]
+
+
+    def get_D(self, stream="color"):
+        """Live distortion coefficients as a plain list (JSON-safe, no numpy)."""
+        i = self._stream_intrinsics(stream)
+        return [float(v) for v in i.coeffs]
+
+
     def _validate_align_to(self, align_to):
         """Validate that the requested align target is one of the channels we
         subscribed to. Raises ValueError if not — no silent fallback. The
