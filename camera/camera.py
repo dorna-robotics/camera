@@ -282,9 +282,47 @@ def _rs_device_dict(device):
     }
 
 
+def _rs_materialize_devices():
+    """Read the current device list, tolerating devices that refuse to open.
+
+    Enumeration re-opens every device to read its info, and a device that is
+    already streaming answers with "failed to set power state". Building the
+    list in one comprehension lets that single failure abort the whole
+    enumeration — so one active camera makes *every* camera invisible, and no
+    second camera can be connected while the first one streams.
+
+    Iterating by index with a per-device guard contains the damage: readable
+    devices still come back, and the caller learns how many slots it could not
+    read. Returns ``(devices, unreadable_count)``.
+    """
+    devs = rs._ctx.query_devices()
+    out, unreadable = [], 0
+    for i in range(len(devs)):
+        try:
+            out.append(_rs_device_dict(devs[i]))
+        except Exception:
+            unreadable += 1
+    return out, unreadable
+
+
 def _rs_repopulate_locked():
     """Caller must hold _RS_LOCK."""
-    rs._all_device = [_rs_device_dict(d) for d in rs._ctx.query_devices()]
+    fresh, unreadable = _rs_materialize_devices()
+    if unreadable:
+        # An unreadable slot is a device that IS on the bus — busy, not gone.
+        # Carry its last-known entry over so a streaming camera doesn't drop
+        # out of the list. Cameras we currently hold open are the likely cause
+        # of a busy slot, so they get first claim on the slots we couldn't
+        # read, and we keep no more entries than there were unreadable slots
+        # (an actually-unplugged camera must still be able to disappear).
+        seen = {d["serial_number"] for d in fresh}
+        with _RS_CAM_LOCK:
+            held = set(_RS_CAM_BY_SN.keys())
+        stale = [d for d in getattr(rs, "_all_device", None) or []
+                 if d["serial_number"] not in seen]
+        stale.sort(key=lambda d: d["serial_number"] not in held)
+        fresh.extend(stale[:unreadable])
+    rs._all_device = fresh
 
 
 def _rs_on_devices_changed(_info):
@@ -510,10 +548,13 @@ class Camera(Helper):
         self._set_state("recovering", "rebuilding pipeline")
         # Fast-fail if the device isn't enumerated. The hotplug callback
         # keeps rs._all_device current, so we don't even need a wait loop.
+        # A failed enumeration means we couldn't look, not that the device is
+        # gone (a sibling camera streaming is enough to break it), so fall back
+        # to the last known list rather than declaring the camera unplugged.
         try:
             devs = self._refresh_devices()
         except Exception:
-            devs = []
+            devs = list(getattr(rs, "_all_device", None) or [])
         if self.serial_number and not any(
             d.get("serial_number") == self.serial_number for d in devs
         ):
@@ -629,17 +670,25 @@ class Camera(Helper):
         return rs._all_device
 
     def _wait_for_device(self, serial_number: str, timeout: float = 10.0, sleep: float = 0.25) -> bool:
-        """Wait until a device with given serial appears."""
+        """Wait until a device with given serial appears.
+
+        A failed enumeration is not evidence of absence — it happens routinely
+        while another camera streams — so fall back to the last known list
+        instead of treating the error as "device missing". pipeline.start()
+        remains the real presence test; it works fine on an idle camera even
+        when enumeration is refusing to power up a busy one.
+        """
         t0 = time.time()
-        while time.time() - t0 < timeout:
+        while True:
             try:
                 devs = self._refresh_devices()
-                if any(d["serial_number"] == serial_number for d in devs):
-                    return True
             except Exception:
-                pass
+                devs = list(getattr(rs, "_all_device", None) or [])
+            if any(d["serial_number"] == serial_number for d in devs):
+                return True
+            if time.time() - t0 >= timeout:
+                return False
             time.sleep(sleep)
-        return False
 
     def _stop_pipeline_quiet(self):
         try:
@@ -658,11 +707,20 @@ class Camera(Helper):
         # firmware reset by serial (only affects this camera).
         # Reuse the singleton context — creating a fresh one here would
         # churn the USB hotplug subscription.
+        # Guard each device individually: a sibling camera that is streaming
+        # raises on info reads, and an unguarded loop would abort before ever
+        # reaching ours.
         _rs_ensure_context()
-        for dev in rs._ctx.query_devices():
-            if dev.get_info(rs.camera_info.serial_number) == self.serial_number:
-                dev.hardware_reset()
-                return True
+        devs = rs._ctx.query_devices()
+        for i in range(len(devs)):
+            try:
+                dev = devs[i]
+                if dev.get_info(rs.camera_info.serial_number) != self.serial_number:
+                    continue
+            except Exception:
+                continue
+            dev.hardware_reset()
+            return True
         return False
 
     def _usb_unbind_bind(self):
