@@ -986,6 +986,7 @@ class Camera(Helper):
         self.serial_number = serial_number  # may be filled after selection below
         self.mode = mode
         self.stream = stream
+        self.stream_actual = None   # the mode that actually RUNS (set after pipeline.start)
         self.exposure_set = exposure
         self.K = K
         self.D = D
@@ -1059,15 +1060,37 @@ class Camera(Helper):
                 if "color" in self._enabled_channels:
                     cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
 
-            try:
-                _enable_subscribed(config, stream["width"], stream["height"], stream["fps"])
-                profile = self.pipeline.start(config)
-            except Exception:
-                # fallback to a known-safe resolution
+            # Fallback ladder, not a single jump. 848x480 first: it keeps
+            # the ~16:9 aspect of the 1280x720 default, so calibrated K/D
+            # scaled via native_res stay valid. 640x480 (4:3) is the last
+            # resort — that mode is a sensor CROP, where linearly scaled
+            # intrinsics are wrong (use factory values there).
+            ladder = [(stream["width"], stream["height"], stream["fps"]),
+                      (848, 480, 15), (640, 480, 15)]
+            modes, profile, last_ex = [], None, None
+            for m in ladder:
+                if m not in modes:
+                    modes.append(m)
+            for w, h, fps in modes:
                 config = rs.config()
                 config.enable_device(serial_number)
-                _enable_subscribed(config, 640, 480, 15)
-                profile = self.pipeline.start(config)
+                _enable_subscribed(config, w, h, fps)
+                try:
+                    profile = self.pipeline.start(config)
+                except Exception as ex:
+                    last_ex = ex
+                    continue
+                if (w, h, fps) != modes[0]:
+                    print(f"[camera] {serial_number}: "
+                          f"{stream['width']}x{stream['height']}@{stream['fps']} "
+                          f"unavailable (USB2 link?) — running {w}x{h}@{fps}")
+                # self.stream keeps the REQUEST (recover retries the best
+                # mode); stream_actual is what RUNS — the GUI and the
+                # native_res intrinsics scaling must see reality.
+                self.stream_actual = {"width": w, "height": h, "fps": fps}
+                break
+            if profile is None:
+                raise last_ex
 
             # apply advanced mode + sensor config
             device = profile.get_device()
@@ -1107,7 +1130,11 @@ class Camera(Helper):
             except Exception:
                 pass
 
-            # optional override intrinsics
+            # optional override intrinsics — scaled to the mode that
+            # actually RUNS (stream_actual), not the request: after a
+            # ladder fallback the two differ, and K scaled to the wrong
+            # resolution poisons every pixel->world computation.
+            actual = self.stream_actual or stream
             self.intr = None
             if K is not None and D is not None:
                 K_ = np.array(K)
@@ -1115,12 +1142,12 @@ class Camera(Helper):
                 sx = 1.0
                 sy = 1.0
                 if native_res is not None:
-                    sx = stream["width"] / native_res[0]
-                    sy = stream["height"] / native_res[1]
+                    sx = actual["width"] / native_res[0]
+                    sy = actual["height"] / native_res[1]
 
                 intr = rs.intrinsics()
-                intr.width  = stream["width"]
-                intr.height = stream["height"]
+                intr.width  = actual["width"]
+                intr.height = actual["height"]
                 intr.ppx    = float(K_[0, 2]) * sx
                 intr.ppy    = float(K_[1, 2]) * sy
                 intr.fx     = float(K_[0, 0]) * sx
