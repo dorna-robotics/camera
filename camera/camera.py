@@ -1079,6 +1079,8 @@ class Camera(Helper):
                     profile = self.pipeline.start(config)
                 except Exception as ex:
                     last_ex = ex
+                    print(f"[camera] {serial_number}: {w}x{h}@{fps} failed to start "
+                          f"({type(ex).__name__}) — trying next mode")
                     continue
                 if (w, h, fps) != modes[0]:
                     print(f"[camera] {serial_number}: "
