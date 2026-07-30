@@ -209,6 +209,15 @@ class UEyeXS(object):
                     raise RuntimeError(msg)
                 return False
             dev = match[0]
+            if dev.get("in_use"):
+                # uEye handles are exclusive — a second process cannot open
+                # the camera. Say so instead of a bare init failure.
+                msg = (f"uEye {serial_number} is already in use by another "
+                       f"process (another vision server / notebook holding it?)")
+                self._set_state("down", msg)
+                if raise_on_fail:
+                    raise RuntimeError(msg)
+                return False
         elif devs:
             dev = devs[0]
         else:
