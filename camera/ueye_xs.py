@@ -34,13 +34,15 @@ Differences from the D405, stated instead of papered over:
   ``{"hold": True}`` (freeze the current convergence) — fixed
   kelvin/rgb are ISP-rejected. Bench recipe: let auto settle on the
   lit scene, then hold.
-- **Hotplug.** The uEye SDK has no librealsense-style hotplug callback
-  here; a lightweight watcher polls enumeration ~every 3 s WHILE DOWN
-  and fires ``on_hardware_available`` whenever the serial is enumerable
-  (level-triggered with a 10 s cooldown — the daemon can keep a dropped
-  device listed, so an absent→present edge is not reliable). The pool's
-  AutoRecover loop then heals a replug exactly like the D405 (~90 s
-  measured end-to-end, dominated by the dead grab's USB timeout).
+- **Hotplug.** The uEye SDK has no librealsense-style hotplug callback,
+  so a full-time presence monitor (3 s enumeration poll) substitutes:
+  an unplug is detected in ~6-9 s WITHOUT waiting for a grab to fail
+  (the handle is released immediately — required for the daemon to
+  re-claim the device later), and a replug fires
+  ``on_hardware_available`` within ~3 s of the daemon re-listing it, so
+  the pool's AutoRecover reconnects with no user action — D405-parity
+  timings on both edges. ``recover()`` fast-fails via sysfs when no IDS
+  device is on the USB bus at all.
 
 ``pyueye`` (plus the IDS runtime it wraps) is only required to USE this
 class — importing the module without it works, enumeration returns [],
@@ -383,29 +385,60 @@ class UEyeXS(object):
         self._watch_stop.clear()
 
         def _loop():
-            # LEVEL-triggered, not edge-triggered: the uEye daemon can keep
-            # a dropped device in its enumeration list, so waiting for an
-            # absent→present transition can miss the replug entirely. The
-            # honest rule: while WE are down and the device IS enumerable,
-            # a recovery attempt is warranted — at most every cooldown.
-            # (state=="recovering" pauses the firing, so an in-flight
-            # recovery is never piled on.)
+            # Full-time presence monitor — the uEye SDK has no hotplug
+            # callback, so this poll is the D405-parity substitute:
+            #
+            # while OK:   two consecutive enumeration misses (~6 s) =
+            #             unplugged. Go down NOW (no need to wait for a
+            #             grab to fail and block on a dead handle) and
+            #             RELEASE the handle — the daemon refuses to
+            #             re-claim a re-plugged device while a stale
+            #             handle exists.
+            # while DOWN: device enumerable again -> fire the
+            #             AutoRecover trigger (level-triggered with a
+            #             cooldown; the daemon can keep a dropped device
+            #             listed, so an absent->present edge is not
+            #             reliable). Auto-reconnect, no user action.
             cooldown = 10.0
             last_fire = 0.0
+            misses = 0
             while not self._watch_stop.wait(3.0):
-                if self.state != "down" or not self.serial_number:
+                sn = self.serial_number
+                if not sn:
                     continue
-                present = any(d["serial_number"] == self.serial_number
-                              for d in self.all_device())
-                if present and (time.monotonic() - last_fire) >= cooldown:
-                    last_fire = time.monotonic()
-                    with self._listeners_lock:
-                        cbs = list(self._available_listeners)
-                    for cb in cbs:
-                        try:
-                            cb()
-                        except Exception:
-                            pass
+                if self.state == "ok":
+                    # sysfs is the ground truth here: the daemon keeps a
+                    # device LISTED while our own open handle holds its
+                    # session, so its enumeration cannot see the unplug.
+                    # (Limitation: sysfs has no per-device serial, so with
+                    # several uEyes on one unit an unplug of ours is only
+                    # caught when a grab fails — benches run one XS.)
+                    if self._sysfs_present():
+                        misses = 0
+                        continue
+                    misses += 1
+                    if misses >= 2:
+                        misses = 0
+                        with self._sdk_lock:
+                            self._close_handle_quiet()
+                        self._set_state(
+                            "down",
+                            "device not detected on USB bus — unplugged?")
+                elif self.state == "down":
+                    # Reconnect needs the DAEMON to have re-claimed the
+                    # device, so this side polls its enumeration.
+                    misses = 0
+                    present = any(d["serial_number"] == sn
+                                  for d in self.all_device())
+                    if present and (time.monotonic() - last_fire) >= cooldown:
+                        last_fire = time.monotonic()
+                        with self._listeners_lock:
+                            cbs = list(self._available_listeners)
+                        for cb in cbs:
+                            try:
+                                cb()
+                            except Exception:
+                                pass
 
         self._watch_thread = threading.Thread(target=_loop, daemon=True,
                                               name=f"ueye-watch-{self.serial_number}")
@@ -413,20 +446,51 @@ class UEyeXS(object):
 
     # ── Recovery (Device protocol) ───────────────────────────────────
 
+    @staticmethod
+    def _sysfs_present():
+        """Any USABLE IDS device (vendor 1409) on the USB bus, straight
+        from sysfs — independent of the daemon's enumeration (which keeps
+        a device listed while an open handle holds its session). A
+        deauthorized device (authorized=0) counts as absent — it is
+        unusable, and it is also how unplug is simulated in tests."""
+        import glob
+        for p in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+            try:
+                if open(p).read().strip() != "1409":
+                    continue
+                base = p[: -len("idVendor")]
+                try:
+                    if open(base + "authorized").read().strip() == "0":
+                        continue
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                pass
+        return False
+
     def recover(self):
         with self._recover_lock:
             self._set_state("recovering", "reopening uEye handle")
             # Close FIRST: the daemon refuses to re-register a re-plugged
             # device while a stale handle exists, so checking enumeration
-            # before closing can never succeed after a USB drop. After the
-            # release, give the daemon a moment to claim the device.
+            # before closing can never succeed after a USB drop.
             with self._sdk_lock:
                 self._close_handle_quiet()
+            # Fast judgment: nothing on the USB bus at all -> fail NOW
+            # (D405-parity fast-fail). Only when the device is physically
+            # present but the daemon hasn't re-claimed it yet (it needed
+            # our handle released first) is a short wait warranted.
             deadline = time.time() + 6.0
             while self.serial_number and time.time() < deadline:
                 if any(d["serial_number"] == self.serial_number
                        for d in self.all_device()):
                     break
+                if not self._sysfs_present():
+                    self._set_state(
+                        "down",
+                        "device not detected on USB bus — reconnect the cable and retry")
+                    return False
                 time.sleep(0.5)
             else:
                 if self.serial_number:
