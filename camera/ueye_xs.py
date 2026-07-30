@@ -309,7 +309,9 @@ class UEyeXS(object):
         r2 = ueye.is_Focus(h, ueye.FOC_CMD_GET_MANUAL_FOCUS_MAX, fmax, ueye.sizeof(fmax))
         self.focus_supported = (r1 == 0 and r2 == 0 and fmax.value > fmin.value)
         self.focus_range = (int(fmin.value), int(fmax.value))
-        self.focus_apply(focus or {"mode": "continuous"}, _locked=False)
+        # Default: converge once, then PIN — the lens is manual from the
+        # first frame (region focus / an authored position refine it).
+        self.focus_apply(focus or {"mode": "once"}, _locked=False)
 
         # intrinsics: authored (scaled from native_res) else nominal
         if K is not None and D is not None:
@@ -524,9 +526,19 @@ class UEyeXS(object):
                     return
                 ueye.is_Focus(self._h, ueye.FOC_CMD_SET_ENABLE_AUTOFOCUS, None, 0)
             elif mode == "once":
+                # "once" is a VERB, not a state: converge the camera's AF
+                # one time, then read where the lens landed and PIN it —
+                # the resulting state is manual@position. The lens is
+                # manual all the time; focusing is just how a position
+                # gets chosen.
                 ueye.is_Focus(self._h, ueye.FOC_CMD_SET_DISABLE_AUTOFOCUS, None, 0)
                 ueye.is_Focus(self._h, ueye.FOC_CMD_SET_ENABLE_AUTOFOCUS_ONCE, None, 0)
                 time.sleep(1.0)   # AF motor settle
+                if self.focus_supported:
+                    pos = self._focus_get_position()
+                    self._focus_set_position(pos)
+                    self.focus_cfg = {"mode": "manual", "position": int(pos)}
+                    return
             elif mode == "manual":
                 if "position" not in cfg:
                     raise ValueError('focus mode "manual" needs a "position"')
