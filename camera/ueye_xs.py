@@ -27,8 +27,11 @@ Differences from the D405, stated instead of papered over:
   position — the playground's 'r' key, as an API.
 - **Hotplug.** The uEye SDK has no librealsense-style hotplug callback
   here; a lightweight watcher polls enumeration ~every 3 s WHILE DOWN
-  and fires ``on_hardware_available`` when the serial reappears — so
-  the pool's AutoRecover loop heals a replug exactly like the D405.
+  and fires ``on_hardware_available`` whenever the serial is enumerable
+  (level-triggered with a 10 s cooldown — the daemon can keep a dropped
+  device listed, so an absent→present edge is not reliable). The pool's
+  AutoRecover loop then heals a replug exactly like the D405 (~90 s
+  measured end-to-end, dominated by the dead grab's USB timeout).
 
 ``pyueye`` (plus the IDS runtime it wraps) is only required to USE this
 class — importing the module without it works, enumeration returns [],
@@ -332,14 +335,22 @@ class UEyeXS(object):
         self._watch_stop.clear()
 
         def _loop():
-            was_present = True
+            # LEVEL-triggered, not edge-triggered: the uEye daemon can keep
+            # a dropped device in its enumeration list, so waiting for an
+            # absent→present transition can miss the replug entirely. The
+            # honest rule: while WE are down and the device IS enumerable,
+            # a recovery attempt is warranted — at most every cooldown.
+            # (state=="recovering" pauses the firing, so an in-flight
+            # recovery is never piled on.)
+            cooldown = 10.0
+            last_fire = 0.0
             while not self._watch_stop.wait(3.0):
                 if self.state != "down" or not self.serial_number:
-                    was_present = True
                     continue
                 present = any(d["serial_number"] == self.serial_number
                               for d in self.all_device())
-                if present and not was_present:
+                if present and (time.monotonic() - last_fire) >= cooldown:
+                    last_fire = time.monotonic()
                     with self._listeners_lock:
                         cbs = list(self._available_listeners)
                     for cb in cbs:
@@ -347,7 +358,6 @@ class UEyeXS(object):
                             cb()
                         except Exception:
                             pass
-                was_present = present
 
         self._watch_thread = threading.Thread(target=_loop, daemon=True,
                                               name=f"ueye-watch-{self.serial_number}")
@@ -358,15 +368,24 @@ class UEyeXS(object):
     def recover(self):
         with self._recover_lock:
             self._set_state("recovering", "reopening uEye handle")
-            if self.serial_number and not any(
-                d["serial_number"] == self.serial_number for d in self.all_device()
-            ):
-                self._set_state(
-                    "down",
-                    "device not detected on USB bus — reconnect the cable and retry")
-                return False
+            # Close FIRST: the daemon refuses to re-register a re-plugged
+            # device while a stale handle exists, so checking enumeration
+            # before closing can never succeed after a USB drop. After the
+            # release, give the daemon a moment to claim the device.
             with self._sdk_lock:
                 self._close_handle_quiet()
+            deadline = time.time() + 6.0
+            while self.serial_number and time.time() < deadline:
+                if any(d["serial_number"] == self.serial_number
+                       for d in self.all_device()):
+                    break
+                time.sleep(0.5)
+            else:
+                if self.serial_number:
+                    self._set_state(
+                        "down",
+                        "device not detected on USB bus — reconnect the cable and retry")
+                    return False
             ok = self.connect(**self._connect_kwargs)
             return bool(ok)
 
@@ -400,6 +419,12 @@ class UEyeXS(object):
                     ueye.is_FreeImageMem(self._h, mem_ptr, mem_id)
                 return np.reshape(arr, (h_px, w, 3))
             except Exception as ex:
+                # Release the handle IMMEDIATELY: the uEye daemon will not
+                # re-register a re-plugged device while a stale handle to
+                # it exists, so holding on would deadlock recovery (the
+                # replug watcher polls enumeration, which stays empty
+                # until the handle is freed).
+                self._close_handle_quiet()
                 self._set_state("down", f"frame grab failed: {ex}")
                 raise
 
