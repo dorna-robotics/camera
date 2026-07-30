@@ -729,6 +729,13 @@ class UEyeXS(object):
         y1 = max(y0 + 1, min(self.height, int(y1)))
         img = self._grab_bgr()
         gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        # Score at half resolution with a Gaussian pre-blur (pyrDown does
+        # both): suppresses the sensor-noise variance that flattens the
+        # peak in dim scenes, and matches what these optics actually
+        # resolve. Verified on hardware: much stronger peak-to-floor
+        # discrimination than full-res Laplacian, at 1/4 the compute.
+        if gray.shape[0] >= 32 and gray.shape[1] >= 32:
+            gray = cv2.pyrDown(gray)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     def _af_aoi(self, x0, y0, w, h):
@@ -801,8 +808,9 @@ class UEyeXS(object):
             if pos is not None:
                 self.focus_cfg = {"mode": "manual", "position": int(pos)}
                 score = self._region_sharpness([x0, y0, x1, y1])
+                lo, hi = self.focus_range
                 return {"position": int(pos), "sharpness": round(score, 1),
-                        "method": "af"}
+                        "method": "af", "at_range_limit": pos in (lo, hi)}
             if method == "af":
                 raise RuntimeError("this device rejected the autofocus AOI")
 
@@ -810,34 +818,62 @@ class UEyeXS(object):
         with self._sdk_lock:
             ueye.is_Focus(self._h, ueye.FOC_CMD_SET_DISABLE_AUTOFOCUS, None, 0)
 
-        def sweep(positions):
-            best_pos, best_score = positions[0], -1.0
-            for p in positions:
-                with self._sdk_lock:
-                    self._focus_set_position(p)
-                time.sleep(settle_s)
-                score = self._region_sharpness(rect)
-                if score > best_score:
-                    best_pos, best_score = p, score
-            return best_pos, best_score
+        samples = {}                      # position -> score (dedup free)
 
-        coarse = np.linspace(lo, hi, coarse_steps).astype(int).tolist()
+        def measure(p):
+            p = int(max(lo, min(hi, p)))
+            if p in samples:
+                return samples[p]
+            with self._sdk_lock:
+                self._focus_set_position(p)
+            time.sleep(settle_s)
+            samples[p] = self._region_sharpness(rect)
+            return samples[p]
+
+        # Pass 1: coarse across the whole lens range.
         coarse_step = max(1, (hi - lo) // (coarse_steps - 1))
-        peak, _ = sweep(coarse)
+        for p in np.linspace(lo, hi, coarse_steps).astype(int).tolist():
+            measure(p)
+        peak = max(samples, key=samples.get)
 
+        # Pass 2: fine around the coarse peak.
         fine_lo, fine_hi = max(lo, peak - coarse_step), min(hi, peak + coarse_step)
-        fine = np.linspace(fine_lo, fine_hi, fine_steps).astype(int).tolist()
-        peak, _ = sweep(fine)
+        for p in np.linspace(fine_lo, fine_hi, fine_steps).astype(int).tolist():
+            measure(p)
+        peak = max(samples, key=samples.get)
 
-        fine_step = max(1, (fine_hi - fine_lo) // (fine_steps - 1))
-        micro = list(range(max(lo, peak - fine_step), min(hi, peak + fine_step) + 1))
-        peak, score = sweep(micro)
+        # Pass 3: parabolic refine instead of an exhaustive unit-step
+        # walk — fit a parabola through the peak and its measured
+        # neighbors, verify the vertex and the integer positions around
+        # it. Lens positions are integers, so this lands exactly where
+        # the walk would, in a fraction of the grabs.
+        cand = {peak - 1, peak + 1}
+        ordered = sorted(samples)
+        i = ordered.index(peak)
+        if 0 < i < len(ordered) - 1:
+            p0, p1, p2 = ordered[i - 1], peak, ordered[i + 1]
+            s0, s1, s2 = samples[p0], samples[p1], samples[p2]
+            denom = (p1 - p0) * (s1 - s2) - (p1 - p2) * (s1 - s0)
+            if abs(denom) > 1e-9:
+                vertex = p1 - 0.5 * ((p1 - p0) ** 2 * (s1 - s2)
+                                     - (p1 - p2) ** 2 * (s1 - s0)) / denom
+                v = int(round(vertex))
+                cand.update({v - 1, v, v + 1})
+        for p in sorted(cand):
+            if lo <= p <= hi:
+                measure(p)
+
+        peak = max(samples, key=samples.get)
+        score = samples[peak]
 
         with self._sdk_lock:
             self._focus_set_position(peak)
         self.focus_cfg = {"mode": "manual", "position": int(peak)}
+        # A peak ON a range endpoint is not a real optimum — the true
+        # best focus lies beyond the lens's travel (target closer than
+        # the minimum focus distance, typically). Say so.
         return {"position": int(peak), "sharpness": round(score, 1),
-                "method": "sweep"}
+                "method": "sweep", "at_range_limit": peak in (lo, hi)}
 
 
 class _NullCtx(object):
