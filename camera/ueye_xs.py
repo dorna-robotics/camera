@@ -21,10 +21,19 @@ Differences from the D405, stated instead of papered over:
   (sensor-spec focal length, centered principal point, zero distortion)
   is reported and labeled ``"nominal"`` in ``camera_info``.
 - **Autofocus.** The XS has a liquid lens: continuous AF, one-shot AF,
-  and manual positions (~0..255). ``focus_region(rect)`` runs the
-  region-tune sweep (coarse -> fine -> micro, scored by Laplacian
-  variance inside ``rect``) and settles on the sharpest manual
-  position — the playground's 'r' key, as an API.
+  and manual positions (device range probed, ~112..240 on Rev 1.1).
+  ``focus_region(rect)`` prefers the SDK's native AF AOI (hardware AF
+  pointed at the rect, ~1-2 s) and falls back to the region-tune sweep
+  (coarse -> fine -> micro, Laplacian variance inside ``rect``,
+  ~10-20 s). NOTE: the XS Rev 1.1 does NOT expose the AF-AOI capability
+  (FOC_CAP_AUTOFOCUS_AOI absent — verified on hardware), so on this
+  device region focus is always the sweep.
+- **Exposure / white balance.** The XS ISP owns both. Exposure is
+  auto-ONLY (readable via ``get_exposure``; manual sets are refused
+  honestly). White balance has two states: ``{"auto": True}`` and
+  ``{"hold": True}`` (freeze the current convergence) — fixed
+  kelvin/rgb are ISP-rejected. Bench recipe: let auto settle on the
+  lit scene, then hold.
 - **Hotplug.** The uEye SDK has no librealsense-style hotplug callback
   here; a lightweight watcher polls enumeration ~every 3 s WHILE DOWN
   and fires ``on_hardware_available`` whenever the serial is enumerable
@@ -95,10 +104,12 @@ class UEyeXS(object):
         self.stream_actual = None
         self.filter = {}
 
-        # focus state
+        # focus / exposure / white-balance state (last applied config)
         self.focus_supported = False
         self.focus_range = (0, 0)
         self.focus_cfg = {"mode": "continuous"}
+        self.wb_cfg = {"auto": True}
+        self.exposure_auto = True
 
         # replug watcher (runs only while state == "down")
         self._watch_stop = threading.Event()
@@ -175,7 +186,8 @@ class UEyeXS(object):
         D=None,
         native_res=None,
         focus=None,           # {"mode": "continuous"} | {"mode":"manual","position":N}
-        exposure=None,        # ms, None = camera auto (hands-off)
+        exposure=None,        # MUST be None — the XS ISP owns exposure (auto only)
+        wb=None,              # {"auto": True} | {"hold": True}
         mode="bgr",
         filter={},
         max_tries=3,
@@ -194,7 +206,7 @@ class UEyeXS(object):
         self._connect_kwargs = dict(
             serial_number=serial_number, stream=stream, K=K, D=D,
             native_res=native_res, focus=focus, exposure=exposure,
-            mode=mode, filter=filter, max_tries=max_tries,
+            wb=wb, mode=mode, filter=filter, max_tries=max_tries,
         )
         self.filter = filter
         self.mode = mode
@@ -230,7 +242,7 @@ class UEyeXS(object):
         last_ex = None
         for _ in range(max_tries):
             try:
-                self._open(dev, K, D, native_res, focus, exposure)
+                self._open(dev, K, D, native_res, focus, exposure, wb)
                 # end-to-end verification — one real frame
                 self._grab_bgr()
                 self._set_state("ok", "")
@@ -246,7 +258,7 @@ class UEyeXS(object):
             raise RuntimeError(msg)
         return False
 
-    def _open(self, dev, K, D, native_res, focus, exposure):
+    def _open(self, dev, K, D, native_res, focus, exposure, wb=None):
         h = ueye.HIDS(int(dev["dev_id"]) | ueye.IS_USE_DEVICE_ID)
         ret = ueye.is_InitCamera(h, None)
         if ret != 0:
@@ -281,17 +293,15 @@ class UEyeXS(object):
                        "fps": round(float(actual_fps.value), 2)}
         self.stream_actual = dict(self.stream)
 
-        # hands-off color: auto white balance on, gains at defaults
-        ueye.is_SetAutoParameter(h, ueye.IS_SET_ENABLE_AUTO_WHITEBALANCE,
-                                 ueye.c_double(1), ueye.c_double(0))
-        # exposure: authored value = manual; None = camera auto
+        # white balance: authored cfg ({"auto"}/{"hold"}), else auto
+        self.white_balance(wb or {"auto": True}, _locked=False)
+        # exposure: the XS ISP owns it — auto only. Authored exposure is
+        # unhonorable intent, so fail LOUDLY instead of silently ignoring.
         if exposure is not None:
-            exp = ueye.c_double(float(exposure))
-            ueye.is_Exposure(h, ueye.IS_EXPOSURE_CMD_SET_EXPOSURE,
-                             exp, ueye.sizeof(exp))
-        else:
-            ueye.is_SetAutoParameter(h, ueye.IS_SET_ENABLE_AUTO_SHUTTER,
-                                     ueye.c_double(1), ueye.c_double(0))
+            raise ValueError(
+                "camera_cfg exposure is not supported on the uEye XS — "
+                "its ISP owns exposure (auto only); remove the key or use "
+                "the detection's `intensity` for software brightness")
 
         # focus capability probe
         fmin, fmax = ueye.c_uint(0), ueye.c_uint(0)
@@ -535,6 +545,79 @@ class UEyeXS(object):
     def focus_once(self):
         self.focus_apply({"mode": "once"})
 
+    # ── Exposure — the XS's ISP OWNS exposure (verified on hardware:
+    #    every auto-shutter disable variant returns error 155 and manual
+    #    sets are silently overridden). Auto-only; the live value is
+    #    readable. The detection pipeline's software `intensity` is the
+    #    knob for output brightness. ─────────────────────────────────
+
+    def get_exposure(self):
+        """Current exposure time in ms — whatever the ISP's auto chose."""
+        if self._h is None:
+            raise RuntimeError("uEye camera not connected")
+        v = ueye.c_double(0)
+        with self._sdk_lock:
+            ueye.is_Exposure(self._h, ueye.IS_EXPOSURE_CMD_GET_EXPOSURE,
+                             v, ueye.sizeof(v))
+        return round(float(v.value), 3)
+
+    def set_exposure(self, exposure, _locked=True):
+        raise RuntimeError(
+            "the uEye XS ISP owns exposure — manual exposure is not "
+            "supported on this device (auto only; read it with "
+            "get_exposure(); use the detection's `intensity` for "
+            "software brightness)")
+
+    def auto_exposure(self, enable=True, _locked=True):
+        """The XS is ALWAYS auto-exposure; enable=True is a no-op,
+        enable=False is honestly refused."""
+        if not enable:
+            self.set_exposure(None)   # raises the same truth
+        self.exposure_auto = True
+        return True
+
+    # ── White balance — two honest states (verified on hardware:
+    #    kelvin / rgb multipliers are ISP-rejected on the XS):
+    #        {"auto": True}   in-camera auto WB (connect default)
+    #        {"hold": True}   freeze WB at its current convergence
+    #    The bench recipe: let auto settle on the lit scene, then hold —
+    #    deterministic color from then on (same philosophy as pinning
+    #    focus). ────────────────────────────────────────────────────────
+
+    def white_balance(self, cfg, _locked=True):
+        if self._h is None:
+            raise RuntimeError("uEye camera not connected")
+        cfg = dict(cfg or {})
+        if not (cfg.get("auto") or cfg.get("hold")):
+            raise ValueError(
+                'wb needs {"auto": True} or {"hold": True} — the XS ISP '
+                "does not support fixed kelvin/rgb white balance; hold "
+                "freezes the current auto convergence instead")
+        on = ueye.c_double(0 if cfg.get("hold") else 1)
+        lock = self._sdk_lock if _locked else _NullCtx()
+        with lock:
+            ret = ueye.is_SetAutoParameter(
+                self._h, ueye.IS_SET_ENABLE_AUTO_SENSOR_WHITEBALANCE,
+                on, ueye.c_double(0))
+            if ret != 0:
+                raise RuntimeError(f"white balance set failed (code {ret})")
+        self.wb_cfg = {"hold": True} if cfg.get("hold") else {"auto": True}
+        return dict(self.wb_cfg)
+
+    def white_balance_info(self):
+        out = {"cfg": dict(self.wb_cfg)}
+        if self._h is not None:
+            try:
+                a, b = ueye.c_double(-1), ueye.c_double(0)
+                with self._sdk_lock:
+                    ret = ueye.is_SetAutoParameter(
+                        self._h, ueye.IS_GET_ENABLE_AUTO_SENSOR_WHITEBALANCE, a, b)
+                if ret == 0:
+                    out["auto"] = bool(a.value)
+            except Exception:
+                pass
+        return out
+
     def _region_sharpness(self, rect):
         x0, y0, x1, y1 = rect
         x0 = max(0, min(self.width - 1, int(x0)))
@@ -545,17 +628,81 @@ class UEyeXS(object):
         gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    def focus_region(self, rect, coarse_steps=12, fine_steps=8, settle_s=0.15):
-        """Region autofocus: 3-pass manual-lens sweep scored by Laplacian
-        variance inside ``rect`` = [x0, y0, x1, y1] (full-res pixels).
-        Settles on the sharpest position, switches the camera to manual
-        focus, and returns {"position", "sharpness"}. Slow (~15-30 s) —
-        run it from a tuning flow, then PIN the returned position (in
-        the camera cfg or a detection's ``focus``) for production."""
+    def _af_aoi(self, x0, y0, w, h):
+        """Point the camera's own AF measurement window at a rect."""
+        aoi = ueye.AUTOFOCUS_AOI()
+        aoi.uNumberAOI = ueye.c_uint(0)
+        aoi.rcAOI.s32X = ueye.c_int(int(x0))
+        aoi.rcAOI.s32Y = ueye.c_int(int(y0))
+        aoi.rcAOI.s32Width = ueye.c_int(int(w))
+        aoi.rcAOI.s32Height = ueye.c_int(int(h))
+        aoi.eWeight = ueye.AUTOFOCUS_AOI_WEIGHT_MIDDLE
+        return ueye.is_Focus(self._h, ueye.FOC_CMD_SET_AUTOFOCUS_AOI,
+                             aoi, ueye.sizeof(aoi))
+
+    def _af_region_once(self, x0, y0, w, h, timeout_s=5.0):
+        """Hardware region AF: set the AF AOI, one-shot the camera's own
+        autofocus, wait for FOC_STATUS_FOCUSED, read where the lens
+        landed and pin it there. ~1-2 s. Returns the position, or None
+        when the device rejects the AOI (caller falls back to the sweep).
+        The AOI is restored to full frame afterwards so later AF/Auto
+        calls behave normally."""
+        with self._sdk_lock:
+            if self._af_aoi(x0, y0, w, h) != 0:
+                return None
+            ueye.is_Focus(self._h, ueye.FOC_CMD_SET_DISABLE_AUTOFOCUS, None, 0)
+            ueye.is_Focus(self._h, ueye.FOC_CMD_SET_ENABLE_AUTOFOCUS_ONCE, None, 0)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            time.sleep(0.3)
+            st = ueye.c_uint(0)
+            with self._sdk_lock:
+                r = ueye.is_Focus(self._h, ueye.FOC_CMD_GET_AUTOFOCUS_STATUS,
+                                  st, ueye.sizeof(st))
+            if r == 0 and st.value in (int(ueye.FOC_STATUS_FOCUSED),
+                                       int(ueye.FOC_STATUS_TIMEOUT),
+                                       int(ueye.FOC_STATUS_ERROR)):
+                break
+        with self._sdk_lock:
+            pos = self._focus_get_position()
+            self._focus_set_position(pos)      # pin exactly where AF landed
+            self._af_aoi(0, 0, self.width, self.height)   # AOI back to full
+        return int(pos)
+
+    def focus_region(self, rect, coarse_steps=12, fine_steps=8, settle_s=0.15,
+                     method="auto"):
+        """Region autofocus on ``rect`` = [x0, y0, x1, y1] (full-res
+        pixels). Ends with the camera in MANUAL focus at the found
+        position and returns {"position", "sharpness", "method"}.
+
+        method:
+          "auto"  (default) — the camera's own hardware AF pointed at the
+                  rect via the AF AOI (~1-2 s); falls back to the sweep
+                  if the device rejects the AOI.
+          "af"    hardware AF AOI only (raises if unsupported).
+          "sweep" the 3-pass manual-lens sweep scored by Laplacian
+                  variance inside the rect (~15-30 s) — deterministic,
+                  uses OUR sharpness metric, needs no AF support.
+        """
         if not self.focus_supported:
             raise RuntimeError("manual focus not supported by this device")
         if self._h is None:
             raise RuntimeError("uEye camera not connected")
+
+        x0, y0, x1, y1 = [int(v) for v in rect]
+        x0, x1 = max(0, min(x0, x1)), min(self.width, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(self.height, max(y0, y1))
+
+        if method in ("auto", "af"):
+            pos = self._af_region_once(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+            if pos is not None:
+                self.focus_cfg = {"mode": "manual", "position": int(pos)}
+                score = self._region_sharpness([x0, y0, x1, y1])
+                return {"position": int(pos), "sharpness": round(score, 1),
+                        "method": "af"}
+            if method == "af":
+                raise RuntimeError("this device rejected the autofocus AOI")
+
         lo, hi = self.focus_range
         with self._sdk_lock:
             ueye.is_Focus(self._h, ueye.FOC_CMD_SET_DISABLE_AUTOFOCUS, None, 0)
@@ -586,7 +733,8 @@ class UEyeXS(object):
         with self._sdk_lock:
             self._focus_set_position(peak)
         self.focus_cfg = {"mode": "manual", "position": int(peak)}
-        return {"position": int(peak), "sharpness": round(score, 1)}
+        return {"position": int(peak), "sharpness": round(score, 1),
+                "method": "sweep"}
 
 
 class _NullCtx(object):
