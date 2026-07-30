@@ -149,9 +149,31 @@ class UEyeXS(object):
     # ── Enumeration ──────────────────────────────────────────────────
 
     @staticmethod
+    def _usb_versions():
+        """USB spec versions of attached IDS devices (vendor 1409), from
+        sysfs. The uEye USB descriptor carries no serial, so per-device
+        matching isn't possible — all_device() stamps the version only
+        when every attached uEye shares one (the common case; the XS is
+        USB 2.0 by design)."""
+        import glob
+        out = set()
+        for p in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+            try:
+                if open(p).read().strip() == "1409":
+                    v = open(p[: -len("idVendor")] + "version").read().strip()
+                    try:
+                        v = f"{float(v):.1f}"   # "2.00" -> "2.0", "3.20" -> "3.2"
+                    except ValueError:
+                        pass
+                    out.add(v)
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
     def all_device():
         """Attached uEye devices: [{serial_number, name, dev_id,
-        camera_type, in_use}]. Empty list when the SDK is absent."""
+        camera_type, in_use, usb_type?}]. Empty when the SDK is absent."""
         if ueye is None:
             return []
         try:
@@ -172,6 +194,11 @@ class UEyeXS(object):
                     "camera_type": "ueye_xs",
                     "in_use": bool(info.dwInUse),
                 })
+            vers = UEyeXS._usb_versions()
+            if len(vers) == 1:
+                usb = vers.pop()
+                for d in out:
+                    d["usb_type"] = usb
             return out
         except Exception:
             return []
