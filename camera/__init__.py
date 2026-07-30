@@ -1,2 +1,3 @@
 from .camera import *
-__version__ = "2.1.0"
+from .ueye_xs import UEyeXS
+__version__ = "2.2.0"
