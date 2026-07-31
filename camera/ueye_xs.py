@@ -78,13 +78,14 @@ class _UEyeIntrinsics(object):
 
 
 class UEyeXS(object):
-    # Nominal pinhole for the uEye XS (OV5640, 1.4 um pixels, 3.4 mm
-    # lens per the datasheet -> 3.4e-3/1.4e-6 = 2429 px; the quoted 67
-    # deg diagonal FOV independently gives 2447 px — 2430 splits the
-    # difference). Used ONLY when no K/D are authored; camera_info
-    # labels it "nominal" — for metric work calibrate at the PINNED
-    # focus position and author K/D/native_res.
-    NOMINAL_FOCAL_PX = 2430.0
+    # Nominal pinhole for the uEye XS, from the IDS datasheet (OV5640,
+    # 1.4 um pixels, integrated 3.7 mm +-5% lens): 3.7e-3/1.4e-6 =
+    # 2643 px, and the quoted FOVs at 600 mm working distance agree —
+    # H 52 deg -> 2657, V 40.2 -> 2656, D 62.7 -> 2660. Used ONLY when
+    # no K/D are authored; camera_info labels it "nominal" — for
+    # metric work calibrate at the PINNED focus position and author
+    # K/D/native_res (the liquid lens breathes ~ percent with focus).
+    NOMINAL_FOCAL_PX = 2650.0
 
     camera_type = "ueye_xs"
 
