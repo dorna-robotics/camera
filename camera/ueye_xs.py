@@ -501,7 +501,16 @@ class UEyeXS(object):
                         "down",
                         "device not detected on USB bus — reconnect the cable and retry")
                     return False
-            ok = self.connect(**self._connect_kwargs)
+            # Recovery restores the RUNTIME state, not the connect-time
+            # authored intent: a region-pinned focus / held WB must
+            # survive a USB blip — the default converge-once on
+            # reconnect would silently move a lens the user pinned.
+            kw = dict(self._connect_kwargs)
+            if self.focus_cfg.get("mode") == "manual":
+                kw["focus"] = dict(self.focus_cfg)
+            if self.wb_cfg:
+                kw["wb"] = dict(self.wb_cfg)
+            ok = self.connect(**kw)
             return bool(ok)
 
     # ── Capture ──────────────────────────────────────────────────────
