@@ -105,6 +105,9 @@ class UEyeXS(object):
         self.stream = None             # {"width","height","fps"} actual
         self.stream_actual = None
         self.filter = {}
+        # Color-only device — camera_list reports this so channel pickers
+        # (playground Source) offer exactly what the camera has.
+        self._enabled_channels = {"color"}
 
         # focus / exposure / white-balance state (last applied config)
         self.focus_supported = False
