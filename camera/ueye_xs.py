@@ -55,6 +55,8 @@ import time
 import numpy as np
 import cv2
 
+from .camera import Helper
+
 try:
     from pyueye import ueye
     _PYUEYE_ERR = None
@@ -77,7 +79,10 @@ class _UEyeIntrinsics(object):
         self.coeffs = [float(v) for v in (coeffs if coeffs is not None else [0.0] * 5)]
 
 
-class UEyeXS(object):
+class UEyeXS(Helper):
+    # Inherits Helper's pure projection math (pixel/xyz_estimate) — the
+    # same surface Detection calls on the D405 class. Helper.xyz needs
+    # depth and honestly fails on this color-only device.
     # Default pinhole for the uEye XS. Focal from the IDS datasheet
     # (OV5640, 1.4 um pixels, integrated 3.7 mm +-5% lens): 3.7e-3/
     # 1.4e-6 = 2643 px, and the quoted FOVs at 600 mm agree — H 52
@@ -94,6 +99,7 @@ class UEyeXS(object):
     camera_type = "ueye_xs"
 
     def __init__(self):
+        super().__init__()
         self.serial_number = None
         self.state = "down"
         self.msg = "not connected"
