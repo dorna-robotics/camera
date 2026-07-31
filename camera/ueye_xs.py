@@ -78,14 +78,18 @@ class _UEyeIntrinsics(object):
 
 
 class UEyeXS(object):
-    # Nominal pinhole for the uEye XS, from the IDS datasheet (OV5640,
-    # 1.4 um pixels, integrated 3.7 mm +-5% lens): 3.7e-3/1.4e-6 =
-    # 2643 px, and the quoted FOVs at 600 mm working distance agree —
-    # H 52 deg -> 2657, V 40.2 -> 2656, D 62.7 -> 2660. Used ONLY when
-    # no K/D are authored; camera_info labels it "nominal" — for
-    # metric work calibrate at the PINNED focus position and author
-    # K/D/native_res (the liquid lens breathes ~ percent with focus).
+    # Default pinhole for the uEye XS. Focal from the IDS datasheet
+    # (OV5640, 1.4 um pixels, integrated 3.7 mm +-5% lens): 3.7e-3/
+    # 1.4e-6 = 2643 px, and the quoted FOVs at 600 mm agree — H 52
+    # deg -> 2657, V 40.2 -> 2656, D 62.7 -> 2660. The principal
+    # point is BENCH-MEASURED (an on-axis 22 mm disc at 100 mm): the
+    # XS sensor sits ~0.4 mm decentered under the lens, so the image
+    # center is NOT the optical center. Measured on one unit and
+    # shipped as the model default; a unit that deviates authors
+    # K/D/native_res in camera_cfg (that override always wins).
     NOMINAL_FOCAL_PX = 2650.0
+    NOMINAL_PPX = 1234.0
+    NOMINAL_PPY = 664.0
 
     camera_type = "ueye_xs"
 
@@ -367,7 +371,7 @@ class UEyeXS(object):
         self._nominal = _UEyeIntrinsics(
             self.width, self.height,
             self.NOMINAL_FOCAL_PX, self.NOMINAL_FOCAL_PX,
-            self.width / 2.0, self.height / 2.0)
+            self.NOMINAL_PPX, self.NOMINAL_PPY)
 
     def _close_handle_quiet(self):
         h, self._h = self._h, None
