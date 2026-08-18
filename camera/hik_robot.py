@@ -375,6 +375,9 @@ class HikRobot(Helper):
         exposure=None,        # µs (same unit as the D405); None = continuous auto
         gain=None,            # dB; None = continuous auto
         wb=None,              # {"auto": True} | {"once": True} | {"hold": True}
+        packet_delay=None,    # GevSCPD ticks — paces the stream's packet
+                              # bursts for links that can't absorb line-rate
+                              # (Wi-Fi bench: ~8000). None = no pacing (wired).
         mode="bgr",
         filter={},
         max_tries=3,
@@ -398,8 +401,10 @@ class HikRobot(Helper):
         self._connect_kwargs = dict(
             serial_number=serial_number, ip=ip, stream=stream, K=K, D=D,
             native_res=native_res, exposure=exposure, gain=gain, wb=wb,
+            packet_delay=packet_delay,
             mode=mode, filter=filter, max_tries=max_tries,
         )
+        self._packet_delay = packet_delay
         self.filter = filter
         self.mode = mode
 
@@ -541,6 +546,17 @@ class HikRobot(Helper):
                 cam.MV_CC_SetIntValue("GevSCPSPacketSize", int(psize))
         except Exception:
             pass
+
+        # Inter-packet delay — pace stream bursts for links that can't
+        # absorb gigabit line rate (each frame is BURST at line rate no
+        # matter how low the fps; Wi-Fi/router buffers drop the tail of
+        # the burst → the striped-image signature). Wired links: leave
+        # None, pacing costs throughput.
+        if getattr(self, "_packet_delay", None):
+            try:
+                cam.MV_CC_SetIntValue("GevSCPD", int(self._packet_delay))
+            except Exception:
+                pass
 
         # free-run, no trigger
         cam.MV_CC_SetEnumValue("TriggerMode", _mv.MV_TRIGGER_MODE_OFF)
