@@ -1,3 +1,4 @@
 from .camera import *
 from .ueye_xs import UEyeXS
-__version__ = "2.2.0"
+from .hik_robot import HikRobot
+__version__ = "2.3.0"
