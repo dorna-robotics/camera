@@ -106,10 +106,39 @@ def _mvimport_paths():
     return cands
 
 
+def _win_register_runtime_dirs():
+    """Windows: make sure the MVS runtime DLL is findable even when this
+    process was launched BEFORE MVS was installed (its PATH predates the
+    installer's edit — a very common Jupyter/VS Code situation; a kernel
+    restart doesn't help because the kernel inherits the stale env from
+    its parent). Probe the env var and the default install locations and
+    register whichever exists, both ways: os.add_dll_directory (the
+    Python 3.8+ mechanism) and a PATH prepend (dependent DLLs)."""
+    if os.name != "nt":
+        return
+    cands = []
+    env = os.environ.get("MVCAM_COMMON_RUNENV")
+    if env:
+        cands.append(os.path.join(env, "Win64_x64"))
+    for cf in (os.environ.get("CommonProgramFiles(x86)"),
+               os.environ.get("CommonProgramFiles")):
+        if cf:
+            cands.append(os.path.join(cf, "MVS", "Runtime", "Win64_x64"))
+    for d in cands:
+        if os.path.isfile(os.path.join(d, "MvCameraControl.dll")):
+            try:
+                os.add_dll_directory(d)
+            except Exception:
+                pass
+            if d not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+
 # Import the bindings: plain import first (already on PYTHONPATH or
 # vendored next to the caller), then extend sys.path with the known
 # locations and retry. Failure leaves _mv=None — the module stays
 # importable, enumeration returns [], connect() raises actionably.
+_win_register_runtime_dirs()
 try:
     import MvCameraControl_class as _mv
     _MVS_ERR = None
@@ -152,9 +181,61 @@ def _ip_to_str(n):
     return ".".join(str((int(n) >> s) & 0xFF) for s in (24, 16, 8, 0))
 
 
+def _ip_to_int(ip_str):
+    a, b, c, d = (int(x) for x in str(ip_str).split("."))
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _local_ip_for(dst_ip):
+    """The local NIC address the OS would route to ``dst_ip`` from —
+    the connect() trick sends no traffic, it only resolves the route."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((dst_ip, 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def _ping(ip, timeout_s=1):
+    """One ICMP ping, cross-platform, quiet. Used as the presence probe
+    for cross-subnet cameras that broadcast discovery cannot see."""
+    import subprocess
+    if os.name == "nt":
+        cmd = ["ping", "-n", "1", "-w", str(int(timeout_s * 1000)), ip]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(int(timeout_s)), ip]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=timeout_s + 2).returncode == 0
+    except Exception:
+        return False
+
+
 def _cstr(buf):
     """NUL-terminated ctypes char/ubyte array -> str."""
     return bytes(bytearray(buf)).partition(b"\0")[0].decode(errors="replace")
+
+
+_ERR_NAMES = None
+
+
+def _err(ret):
+    """Human-readable MVS error: 'MV_E_UDP_RECV_DATA (0x80000214)'
+    instead of a bare hex code — the names come from the vendored
+    MvErrorDefine constants."""
+    global _ERR_NAMES
+    code = ret & 0xFFFFFFFF
+    if _ERR_NAMES is None and _mv is not None:
+        try:
+            _ERR_NAMES = {v & 0xFFFFFFFF: k for k, v in vars(_mv).items()
+                          if k.startswith("MV_E_") and isinstance(v, int)}
+        except Exception:
+            _ERR_NAMES = {}
+    name = (_ERR_NAMES or {}).get(code)
+    return f"{name} (0x{code:08x})" if name else f"0x{code:08x}"
 
 
 class _HikIntrinsics(object):
@@ -193,6 +274,7 @@ class HikRobot(Helper):
         self._sdk_lock = threading.Lock()
         self._connect_kwargs = {}
         self._recover_lock = threading.Lock()
+        self._cross_subnet = False     # opened by IP across a router?
 
         self.width = 0
         self.height = 0
@@ -330,25 +412,50 @@ class HikRobot(Helper):
             match = [(s, d) for s, d in devs if d["ip"] == str(ip)]
         else:
             match = devs
-        if not match:
+
+        self._cross_subnet = False
+        if match:
+            dev_struct, dev = match[0]
+            self.serial_number = dev["serial_number"]
+            self.ip = dev["ip"]
+        elif ip and _ping(str(ip)):
+            # Cross-subnet fallback: broadcast discovery is subnet-local,
+            # but the camera is routable (ping answers) — e.g. host on
+            # 10.0.3.x, camera on 10.0.1.x behind a router. Build the
+            # GigE device descriptor by hand and open unicast. The serial
+            # is read from the device after open. Presence monitoring
+            # switches to ICMP ping (discovery can't see the device).
+            # NOTE: routed paths (especially Wi-Fi) drop UDP stream
+            # packets — fine for bench tests, use a same-subnet NIC for
+            # production streaming.
+            dev_struct = self._device_info_for_ip(str(ip))
+            dev = None
+            self.serial_number = None       # filled after open
+            self.ip = str(ip)
+            self._cross_subnet = True
+        else:
             what = (f"serial={serial_number}" if serial_number
                     else f"ip={ip}" if ip else "any")
-            msg = (f"Hikrobot device not found on the network ({what}) — "
-                   f"check PoE link and that the camera subnet matches the "
-                   f"host NIC")
+            msg = (f"Hikrobot device not found ({what}) — not in broadcast "
+                   f"discovery and not answering ping. Check PoE link/power "
+                   f"and that the camera is reachable from this host")
             self._set_state("down", msg)
             if raise_on_fail:
                 raise RuntimeError(msg)
             return False
-        dev_struct, dev = match[0]
-        self.serial_number = dev["serial_number"]
-        self.ip = dev["ip"]
 
         last_ex = None
         for _ in range(max_tries):
             try:
                 self._open(dev_struct, stream, K, D, native_res,
                            exposure, gain, wb)
+                # cross-subnet open: discovery gave us no serial — read
+                # it from the device so id/presence tracking work.
+                if not self.serial_number:
+                    try:
+                        self.serial_number = self._read_string("DeviceSerialNumber")
+                    except Exception:
+                        self.serial_number = self.ip   # last-resort stable id
                 # end-to-end verification — one real frame
                 self._grab_bgr()
                 self._set_state("ok", "")
@@ -380,17 +487,51 @@ class HikRobot(Helper):
             raise RuntimeError(f"GetFloatValue({key}) failed")
         return float(v.fCurValue)
 
+    def _read_string(self, key):
+        v = _mv.MVCC_STRINGVALUE()
+        ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
+        if self._cam.MV_CC_GetStringValue(key, v) != 0:
+            raise RuntimeError(f"GetStringValue({key}) failed")
+        return _cstr(v.chCurValue)
+
+    @staticmethod
+    def _device_info_for_ip(ip_str):
+        """Hand-built GigE device descriptor for a camera broadcast
+        discovery cannot see (different subnet, routed path). nNetExport
+        tells the SDK which local NIC to bind — resolved from the OS
+        routing table."""
+        st = _mv.MV_CC_DEVICE_INFO()
+        ctypes.memset(ctypes.byref(st), 0, ctypes.sizeof(st))
+        st.nTLayerType = _mv.MV_GIGE_DEVICE
+        st.SpecialInfo.stGigEInfo.nCurrentIp = _ip_to_int(ip_str)
+        try:
+            st.SpecialInfo.stGigEInfo.nNetExport = _ip_to_int(_local_ip_for(ip_str))
+        except Exception:
+            pass
+        return st
+
+    def _present(self):
+        """Is the camera visible right now? Broadcast discovery on the
+        local subnet; ICMP ping for cross-subnet cameras discovery
+        cannot see."""
+        sn = self.serial_number
+        if sn and any(d["serial_number"] == sn for d in self.all_device()):
+            return True
+        if self._cross_subnet and self.ip:
+            return _ping(self.ip)
+        return False
+
     def _open(self, dev_struct, stream, K, D, native_res, exposure, gain, wb):
         cam = _mv.MvCamera()
         ret = cam.MV_CC_CreateHandle(dev_struct)
         if ret != 0:
-            raise RuntimeError(f"MV_CC_CreateHandle failed (0x{ret & 0xFFFFFFFF:08x})")
+            raise RuntimeError(f"MV_CC_CreateHandle failed ({_err(ret)})")
         self._cam = cam
         ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
         if ret != 0:
             # exclusive GigE control — a second host/process cannot open it
             raise RuntimeError(
-                f"MV_CC_OpenDevice failed (0x{ret & 0xFFFFFFFF:08x}) — "
+                f"MV_CC_OpenDevice failed ({_err(ret)}) — "
                 f"is another process/host holding the camera?")
 
         # GigE tuning: jumbo-aware packet size (big win on PoE links)
@@ -455,7 +596,7 @@ class HikRobot(Helper):
 
         ret = cam.MV_CC_StartGrabbing()
         if ret != 0:
-            raise RuntimeError(f"MV_CC_StartGrabbing failed (0x{ret & 0xFFFFFFFF:08x})")
+            raise RuntimeError(f"MV_CC_StartGrabbing failed ({_err(ret)})")
 
         # intrinsics: authored (scaled from native_res) else nominal
         # placeholder — a C-mount lens is interchangeable, so there is no
@@ -519,11 +660,9 @@ class HikRobot(Helper):
             last_fire = 0.0
             misses = 0
             while not self._watch_stop.wait(3.0):
-                sn = self.serial_number
-                if not sn:
+                if not (self.serial_number or self.ip):
                     continue
-                present = any(d["serial_number"] == sn
-                              for d in self.all_device())
+                present = self._present()
                 if self.state == "ok":
                     if present:
                         misses = 0
@@ -568,16 +707,15 @@ class HikRobot(Helper):
             # (D405-parity fast-fail); a camera that IS answering just
             # needs the control channel re-established.
             deadline = time.time() + 6.0
-            while self.serial_number and time.time() < deadline:
-                if any(d["serial_number"] == self.serial_number
-                       for d in self.all_device()):
+            while (self.serial_number or self.ip) and time.time() < deadline:
+                if self._present():
                     break
                 time.sleep(0.5)
             else:
-                if self.serial_number:
+                if self.serial_number or self.ip:
                     self._set_state(
                         "down",
-                        "device not answering GigE discovery — check PoE "
+                        "device not answering discovery/ping — check PoE "
                         "link/power and retry")
                     return False
             ok = self.connect(**dict(self._connect_kwargs))
@@ -605,7 +743,7 @@ class HikRobot(Helper):
                     self._buf, n, info, int(timeout_ms))
                 if ret != 0:
                     raise RuntimeError(
-                        f"MV_CC_GetImageForBGR failed (0x{ret & 0xFFFFFFFF:08x})")
+                        f"MV_CC_GetImageForBGR failed ({_err(ret)})")
                 w, h = int(info.nWidth), int(info.nHeight)
                 arr = np.frombuffer(self._buf, dtype=np.uint8,
                                     count=w * h * 3).reshape(h, w, 3).copy()
@@ -665,7 +803,7 @@ class HikRobot(Helper):
             ret = self._cam.MV_CC_SetFloatValue("ExposureTime", float(exposure))
             if ret != 0:
                 raise RuntimeError(
-                    f"ExposureTime set failed (0x{ret & 0xFFFFFFFF:08x})")
+                    f"ExposureTime set failed ({_err(ret)})")
             self.exposure_auto = False
             return round(self._get_float("ExposureTime"), 1)
 
@@ -700,7 +838,7 @@ class HikRobot(Helper):
             ret = self._cam.MV_CC_SetEnumValue("BalanceWhiteAuto", val)
             if ret != 0:
                 raise RuntimeError(
-                    f"white balance set failed (0x{ret & 0xFFFFFFFF:08x})")
+                    f"white balance set failed ({_err(ret)})")
         self.wb_cfg = store
         return dict(self.wb_cfg)
 
