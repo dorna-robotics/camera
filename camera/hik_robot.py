@@ -378,6 +378,9 @@ class HikRobot(Helper):
         packet_delay=None,    # GevSCPD ticks — paces the stream's packet
                               # bursts for links that can't absorb line-rate
                               # (Wi-Fi bench: ~8000). None = no pacing (wired).
+        binning=None,         # 2 or 4 — on-sensor pixel binning: full FOV at
+                              # 1/4 (or 1/16) the data per frame. THE fix for
+                              # lossy links; also brightens (averaged pixels).
         mode="bgr",
         filter={},
         max_tries=3,
@@ -401,10 +404,11 @@ class HikRobot(Helper):
         self._connect_kwargs = dict(
             serial_number=serial_number, ip=ip, stream=stream, K=K, D=D,
             native_res=native_res, exposure=exposure, gain=gain, wb=wb,
-            packet_delay=packet_delay,
+            packet_delay=packet_delay, binning=binning,
             mode=mode, filter=filter, max_tries=max_tries,
         )
         self._packet_delay = packet_delay
+        self._binning = binning
         self.filter = filter
         self.mode = mode
 
@@ -450,7 +454,7 @@ class HikRobot(Helper):
             return False
 
         last_ex = None
-        for _ in range(max_tries):
+        for attempt in range(max_tries):
             try:
                 self._open(dev_struct, stream, K, D, native_res,
                            exposure, gain, wb)
@@ -469,7 +473,12 @@ class HikRobot(Helper):
             except Exception as ex:
                 last_ex = ex
                 self._close_handle_quiet()
-                time.sleep(0.5)
+                # Backoff past the camera's control-session heartbeat
+                # timeout (~3 s): after an abnormal close (lossy-link
+                # latch) the camera refuses a new exclusive open until
+                # the stale session expires — quick retries all land
+                # inside that window and fail with MV_E_UDP_RECV_DATA.
+                time.sleep(1.0 + 1.5 * attempt)
         msg = f"Hikrobot connect failed: {last_ex}"
         self._set_state("down", msg)
         if raise_on_fail:
@@ -516,13 +525,15 @@ class HikRobot(Helper):
         return st
 
     def _present(self):
-        """Is the camera visible right now? Broadcast discovery on the
-        local subnet; ICMP ping for cross-subnet cameras discovery
-        cannot see."""
+        """Is the camera visible right now? Broadcast discovery first,
+        ICMP ping as the fallback — always, not just cross-subnet:
+        discovery replies are broadcast UDP and get lost routinely on
+        lossy links (Wi-Fi), so a discovery miss alone must never count
+        as device-gone when a unicast ping still answers."""
         sn = self.serial_number
         if sn and any(d["serial_number"] == sn for d in self.all_device()):
             return True
-        if self._cross_subnet and self.ip:
+        if self.ip:
             return _ping(self.ip)
         return False
 
@@ -539,6 +550,16 @@ class HikRobot(Helper):
                 f"MV_CC_OpenDevice failed ({_err(ret)}) — "
                 f"is another process/host holding the camera?")
 
+        # GVCP robustness — must be set AFTER open (verified: pre-open
+        # calls return OK but don't take effect). Retries keep one lost
+        # control reply from escalating; per the SDK docs, "can avoid
+        # dropping the camera". Harmless on clean wired links.
+        try:
+            cam.MV_GIGE_SetGvcpTimeout(300)
+            cam.MV_GIGE_SetRetryGvcpTimes(10)
+        except Exception:
+            pass
+
         # GigE tuning: jumbo-aware packet size (big win on PoE links)
         try:
             psize = cam.MV_CC_GetOptimalPacketSize()
@@ -552,9 +573,42 @@ class HikRobot(Helper):
         # matter how low the fps; Wi-Fi/router buffers drop the tail of
         # the burst → the striped-image signature). Wired links: leave
         # None, pacing costs throughput.
-        if getattr(self, "_packet_delay", None):
+        # NOTE: camera registers PERSIST across sessions — when the
+        # option is not requested, actively restore the full-speed
+        # default, or yesterday's Wi-Fi throttle silently survives into
+        # today's wired session.
+        try:
+            cam.MV_CC_SetIntValue(
+                "GevSCPD", int(getattr(self, "_packet_delay", None) or 0))
+        except Exception:
+            pass
+
+        # Packet resend — re-request lost stream packets instead of
+        # discarding the whole frame. The difference between "mostly
+        # dead" and "usable" on lossy links; harmless on clean wired
+        # links (nothing to resend).
+        try:
+            cam.MV_GIGE_SetResend(1, 100, 50)
+            cam.MV_GIGE_SetResendMaxRetryTimes(5)
+        except Exception:
+            pass
+
+        # On-sensor binning — full FOV at a fraction of the wire data
+        # (2 -> 1/4, 4 -> 1/16 bytes/frame). Set BEFORE Width/Height
+        # are read back so stream_actual reports the binned geometry.
+        # Registers persist across sessions: no binning requested means
+        # binning must be explicitly reset to 1, then Width/Height
+        # restored to the (now larger) sensor maximum.
+        bin_val = int(getattr(self, "_binning", None) or 1)
+        for key in ("BinningHorizontal", "BinningVertical"):
             try:
-                cam.MV_CC_SetIntValue("GevSCPD", int(self._packet_delay))
+                cam.MV_CC_SetEnumValue(key, bin_val)
+            except Exception:
+                pass
+        if not (stream and stream.get("width")):
+            try:
+                cam.MV_CC_SetIntValue("Width", self._get_int("WidthMax"))
+                cam.MV_CC_SetIntValue("Height", self._get_int("HeightMax"))
             except Exception:
                 pass
 
@@ -572,13 +626,17 @@ class HikRobot(Helper):
                         cam.MV_CC_SetIntValue(key, int(want))
                     except Exception:
                         pass
-            fps = stream.get("fps")
+        # fps cap — and when NOT requested, disable the persistent cap a
+        # previous session may have left so the camera runs at its max.
+        fps = stream.get("fps") if stream else None
+        try:
             if fps:
-                try:
-                    cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
-                    cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(fps))
-                except Exception:
-                    pass
+                cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
+                cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(fps))
+            else:
+                cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", False)
+        except Exception:
+            pass
 
         self.width = self._get_int("Width")
         self.height = self._get_int("Height")
@@ -739,35 +797,60 @@ class HikRobot(Helper):
 
     # ── Capture ──────────────────────────────────────────────────────
 
-    def _grab_bgr(self, timeout_ms=5000):
+    def _grab_bgr(self, timeout_ms=5000, retries=2):
         """Single grab -> BGR8 ndarray (h, w, 3). MV_CC_GetImageForBGR
         converts whatever PixelFormat the sensor runs (Bayer, YUV, mono)
-        to BGR in the SDK. Raises on failure and moves state to down —
-        frame fetch is the single source of truth for camera health,
-        same as the D405."""
+        to BGR in the SDK.
+
+        Failure handling distinguishes transient from fatal:
+        - MV_E_NODATA = no complete frame within the timeout. On lossy
+          links (Wi-Fi) packet loss discards frames mid-assembly, so this
+          is RETRYABLE — the session stays up, we retry in place, and
+          only after all retries raise WITHOUT tearing down the handle.
+        - anything else (disconnect, UDP errors) is fatal: release the
+          session immediately — the GigE control channel is exclusive
+          and a wedged session blocks the reopen that recovery needs."""
         with self._sdk_lock:
             if self._cam is None:
-                self._set_state("down", "not connected")
-                raise RuntimeError("Hikrobot camera not connected")
+                self._set_state("down", self.msg or "not connected")
+                raise RuntimeError(
+                    f"Hikrobot camera not connected"
+                    f"{' — ' + self.msg if self.msg else ''} "
+                    f"(call connect() again)")
+            nodata = getattr(_mv, "MV_E_NODATA", 0x80000007) & 0xFFFFFFFF
             try:
                 n = self.width * self.height * 3
                 if self._buf is None or len(self._buf) < n:
                     self._buf = (ctypes.c_ubyte * n)()
-                info = _mv.MV_FRAME_OUT_INFO_EX()
-                ctypes.memset(ctypes.byref(info), 0, ctypes.sizeof(info))
-                ret = self._cam.MV_CC_GetImageForBGR(
-                    self._buf, n, info, int(timeout_ms))
-                if ret != 0:
-                    raise RuntimeError(
-                        f"MV_CC_GetImageForBGR failed ({_err(ret)})")
-                w, h = int(info.nWidth), int(info.nHeight)
-                arr = np.frombuffer(self._buf, dtype=np.uint8,
-                                    count=w * h * 3).reshape(h, w, 3).copy()
-                return arr
+                else:
+                    # zero between grabs: regions a lossy link failed to
+                    # fill then read as black, not ghost bytes from the
+                    # previous frame masquerading as image content.
+                    ctypes.memset(self._buf, 0, n)
+                last = 0
+                for _ in range(max(1, retries + 1)):
+                    info = _mv.MV_FRAME_OUT_INFO_EX()
+                    ctypes.memset(ctypes.byref(info), 0, ctypes.sizeof(info))
+                    ret = self._cam.MV_CC_GetImageForBGR(
+                        self._buf, n, info, int(timeout_ms))
+                    if ret == 0:
+                        w, h = int(info.nWidth), int(info.nHeight)
+                        return np.frombuffer(
+                            self._buf, dtype=np.uint8,
+                            count=w * h * 3).reshape(h, w, 3).copy()
+                    last = ret & 0xFFFFFFFF
+                    if last != nodata:
+                        raise RuntimeError(
+                            f"MV_CC_GetImageForBGR failed ({_err(ret)})")
+                # NODATA through all retries: transient starvation, the
+                # session itself is healthy — do NOT tear it down.
+                raise _TransientGrabError(
+                    f"no complete frame within {timeout_ms}ms x"
+                    f"{retries + 1} tries ({_err(last)}) — lossy link? "
+                    f"retry, lower fps, or set packet_delay")
+            except _TransientGrabError:
+                raise
             except Exception as ex:
-                # Release the session immediately: the GigE control
-                # channel is exclusive and a wedged session blocks the
-                # reopen that recovery needs.
                 self._close_handle_quiet()
                 self._set_state("down", f"frame grab failed: {ex}")
                 raise
@@ -775,7 +858,18 @@ class HikRobot(Helper):
     def get_all(self, align_to=None, alpha=None):
         """Same 9-tuple as Camera.get_all — depth/ir slots are None
         (color-only device); depth_int is the effective intrinsics."""
-        color_img = self._grab_bgr()
+        try:
+            color_img = self._grab_bgr()
+        except _TransientGrabError:
+            raise            # session healthy, caller just retries
+        except Exception:
+            # Fatal grab failure. On lossy links the SDK latches the
+            # device DISCONNECTED after one lost control reply (its own
+            # heartbeat included) — if the camera is still physically
+            # present, rebuild the session once and retry the grab.
+            if not (self._present() and self.recover()):
+                raise
+            color_img = self._grab_bgr()
         if self.state != "ok":
             self._set_state("ok", "")
         depth_int = self.intr if self.intr is not None else self._nominal
@@ -802,43 +896,131 @@ class HikRobot(Helper):
 
     # ── Exposure / gain (real knobs on this sensor, µs like the D405) ─
 
+    def _quiet_session_op(self, fn):
+        """Run ``fn`` against a fresh session that NEVER starts the
+        stream. Control is fully reliable before StartGrabbing (every
+        connect proves it) and hopeless while streaming on a saturated
+        link — so for lossy links this is the only correct home for
+        settings access. Camera registers persist across sessions, so
+        anything ``fn`` sets sticks for the next streaming session.
+        Afterwards the session is left CLOSED with state 'down'; the
+        get_all self-heal (or the pool's AutoRecover) restores the
+        streaming session on the next grab."""
+        with self._sdk_lock:
+            self._close_handle_quiet()
+        last = None
+        for attempt in range(3):
+            # let the camera-side control lease from the previous
+            # (possibly abnormally dead) session expire
+            time.sleep(4.0)
+            cam = None
+            try:
+                match = [(s, d) for s, d in self._enum_raw()
+                         if d["serial_number"] == self.serial_number
+                         or (self.ip and d["ip"] == self.ip)]
+                if match:
+                    st = match[0][0]
+                elif self.ip and _ping(self.ip):
+                    st = self._device_info_for_ip(self.ip)
+                else:
+                    raise RuntimeError("device not present")
+                cam = _mv.MvCamera()
+                if cam.MV_CC_CreateHandle(st) != 0:
+                    raise RuntimeError("CreateHandle failed")
+                ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
+                if ret != 0:
+                    raise RuntimeError(f"quiet open failed ({_err(ret)})")
+                try:
+                    cam.MV_GIGE_SetGvcpTimeout(300)
+                    cam.MV_GIGE_SetRetryGvcpTimes(10)
+                except Exception:
+                    pass
+                with self._sdk_lock:
+                    self._cam = cam
+                try:
+                    return fn()
+                finally:
+                    with self._sdk_lock:
+                        self._close_handle_quiet()
+                    self._set_state(
+                        "down", "idle after control op — reconnect on next grab")
+            except Exception as ex:
+                last = ex
+                if cam is not None and self._cam is not cam:
+                    try:
+                        cam.MV_CC_DestroyHandle()
+                    except Exception:
+                        pass
+        raise RuntimeError(f"control op failed on quiet session: {last}")
+
+    def _control_op(self, fn):
+        """Run a GVCP control operation, surviving lossy links.
+
+        Bench-measured physics (MV-CU060 over Wi-Fi): while the stream
+        runs, the camera→host direction is saturated and control REPLIES
+        essentially never arrive (20 straight SDK-level GVCP retries all
+        lost); worse, the SDK's own heartbeat loses a reply within the
+        FIRST SECOND of streaming and latches the device DISCONNECTED.
+        Before StartGrabbing the same operations always succeed.
+
+        So: on a link the caller declared lossy (packet_delay/binning
+        set at connect), settings access runs in a dedicated quiet
+        session — no stream ever started — via _quiet_session_op, and
+        the streaming session is rebuilt on the next grab. Wired links
+        call straight through (instant), with the quiet session as the
+        fallback if a direct call ever fails."""
+        if self._cam is None and self.serial_number is None and self.ip is None:
+            return fn()   # never connected — honest immediate error
+        lossy = bool(getattr(self, "_packet_delay", None)
+                     or getattr(self, "_binning", None))
+        if lossy:
+            return self._quiet_session_op(fn)
+        try:
+            return fn()
+        except Exception:
+            return self._quiet_session_op(fn)
+
     def get_exposure(self):
         """Current exposure time in µs."""
-        if self._cam is None:
-            raise RuntimeError("Hikrobot camera not connected")
-        with self._sdk_lock:
-            return round(self._get_float("ExposureTime"), 1)
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            with self._sdk_lock:
+                return round(self._get_float("ExposureTime"), 1)
+        return self._control_op(body)
 
     def set_exposure(self, exposure, _locked=True):
         """Pin manual exposure, in µs (same unit as the D405)."""
-        if self._cam is None:
-            raise RuntimeError("Hikrobot camera not connected")
-        lock = self._sdk_lock if _locked else _NullCtx()
-        with lock:
-            self._cam.MV_CC_SetEnumValue("ExposureAuto", 0)   # Off
-            ret = self._cam.MV_CC_SetFloatValue("ExposureTime", float(exposure))
-            if ret != 0:
-                raise RuntimeError(
-                    f"ExposureTime set failed ({_err(ret)})")
-            self.exposure_auto = False
-            return round(self._get_float("ExposureTime"), 1)
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            lock = self._sdk_lock if _locked else _NullCtx()
+            with lock:
+                self._cam.MV_CC_SetEnumValue("ExposureAuto", 0)   # Off
+                ret = self._cam.MV_CC_SetFloatValue("ExposureTime", float(exposure))
+                if ret != 0:
+                    raise RuntimeError(
+                        f"ExposureTime set failed ({_err(ret)})")
+                self.exposure_auto = False
+                return round(self._get_float("ExposureTime"), 1)
+        return self._control_op(body) if _locked else body()
 
     def auto_exposure(self, enable=True, _locked=True):
-        if self._cam is None:
-            raise RuntimeError("Hikrobot camera not connected")
-        lock = self._sdk_lock if _locked else _NullCtx()
-        with lock:
-            self._cam.MV_CC_SetEnumValue("ExposureAuto", 2 if enable else 0)
-            self.exposure_auto = bool(enable)
-            return round(self._get_float("ExposureTime"), 1)
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            lock = self._sdk_lock if _locked else _NullCtx()
+            with lock:
+                self._cam.MV_CC_SetEnumValue("ExposureAuto", 2 if enable else 0)
+                self.exposure_auto = bool(enable)
+                return round(self._get_float("ExposureTime"), 1)
+        return self._control_op(body) if _locked else body()
 
     # ── White balance ────────────────────────────────────────────────
 
     def white_balance(self, cfg, _locked=True):
         """{"auto": True} continuous, {"once": True} converge-then-hold,
         {"hold": True} freeze the current ratios."""
-        if self._cam is None:
-            raise RuntimeError("Hikrobot camera not connected")
         cfg = dict(cfg or {})
         if cfg.get("auto"):
             val, store = 2, {"auto": True}       # Continuous
@@ -849,14 +1031,24 @@ class HikRobot(Helper):
         else:
             raise ValueError(
                 'wb needs {"auto": True}, {"once": True} or {"hold": True}')
-        lock = self._sdk_lock if _locked else _NullCtx()
-        with lock:
-            ret = self._cam.MV_CC_SetEnumValue("BalanceWhiteAuto", val)
-            if ret != 0:
-                raise RuntimeError(
-                    f"white balance set failed ({_err(ret)})")
-        self.wb_cfg = store
-        return dict(self.wb_cfg)
+
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            lock = self._sdk_lock if _locked else _NullCtx()
+            with lock:
+                ret = self._cam.MV_CC_SetEnumValue("BalanceWhiteAuto", val)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"white balance set failed ({_err(ret)})")
+            self.wb_cfg = store
+            return dict(self.wb_cfg)
+        return self._control_op(body) if _locked else body()
+
+
+class _TransientGrabError(RuntimeError):
+    """A grab timed out without a complete frame (packet loss on a lossy
+    link). The session is still healthy — retry, don't reconnect."""
 
 
 class _NullCtx(object):
