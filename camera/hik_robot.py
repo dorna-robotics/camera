@@ -560,6 +560,13 @@ class HikRobot(Helper):
             raise RuntimeError(f"GetFloatValue({key}) failed")
         return float(v.fCurValue)
 
+    def _get_enum(self, key):
+        v = _mv.MVCC_ENUMVALUE()
+        ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
+        if self._cam.MV_CC_GetEnumValue(key, v) != 0:
+            raise RuntimeError(f"GetEnumValue({key}) failed")
+        return int(v.nCurValue)
+
     def _read_string(self, key):
         v = _mv.MVCC_STRINGVALUE()
         ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
@@ -664,6 +671,27 @@ class HikRobot(Helper):
                 cam.MV_CC_SetEnumValue(key, bin_val)
             except Exception:
                 pass
+        # NEVER SILENTLY RUN AT A GEOMETRY THE CALLER DID NOT ASK FOR.
+        # A rejected binning leaves the register at whatever the LAST
+        # session set, so asking for 4 on a sensor that tops out at 2
+        # used to hand back a 2-binned image that looked perfectly
+        # healthy — and every ROI authored against the expected geometry
+        # silently addressed the wrong pixels. Resolution is a contract,
+        # not a preference: fail loudly instead.
+        if getattr(self, "_binning", None):
+            actual_bin = []
+            for key in ("BinningHorizontal", "BinningVertical"):
+                try:
+                    actual_bin.append(self._get_enum(key))
+                except Exception:
+                    actual_bin.append(None)
+            if any(b != bin_val for b in actual_bin if b is not None):
+                raise RuntimeError(
+                    "binning=%d not applied by this sensor (it reports "
+                    "H=%s V=%s). Pick a binning the camera supports — "
+                    "running at a different geometry than requested would "
+                    "silently move every ROI."
+                    % (bin_val, actual_bin[0], actual_bin[1]))
         if not (stream and stream.get("width")):
             try:
                 cam.MV_CC_SetIntValue("Width", self._get_int("WidthMax"))
@@ -706,6 +734,23 @@ class HikRobot(Helper):
         self.stream = {"width": self.width, "height": self.height,
                        "fps": actual_fps}
         self.stream_actual = dict(self.stream)
+
+        # Same contract for an explicitly requested width/height. Sensors
+        # have step constraints, so a request can land on a neighbouring
+        # legal value — which is exactly the silent geometry change that
+        # invalidates authored ROIs. fps is NOT checked: a frame-rate cap
+        # the sensor cannot meet costs throughput, not pixel coordinates.
+        if stream:
+            want_w, want_h = stream.get("width"), stream.get("height")
+            if (want_w and int(want_w) != self.width) or \
+               (want_h and int(want_h) != self.height):
+                raise RuntimeError(
+                    "stream %sx%s not applied — the camera is running at "
+                    "%dx%d. Sensor step constraints can round a request to "
+                    "a neighbouring legal size; accepting that silently "
+                    "would move every ROI authored against the requested "
+                    "geometry."
+                    % (want_w, want_h, self.width, self.height))
 
         # exposure: manual (µs) pins ExposureAuto=Off; None = continuous auto
         if exposure is not None:
