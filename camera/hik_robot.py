@@ -134,11 +134,43 @@ def _win_register_runtime_dirs():
                 os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
 
 
+def _posix_register_runtime_dirs():
+    """Make the runtime findable in a process that never sourced a login
+    shell — a systemd service, cron, a Jupyter kernel launched from a
+    desktop session.
+
+    THE LINUX MVS INSTALLER EXPORTS ITS ENV FROM /etc/profile, which
+    only LOGIN shells read. The vendored bindings build their library
+    path as::
+
+        os.getenv("MVCAM_COMMON_RUNENV") + "/aarch64/libMvCameraControl.so"
+
+    so with the variable unset that is ``None + str`` -> TypeError, the
+    import fails, and enumeration returns [] on a machine where the SDK
+    is installed and the camera is pingable. Measured on a vision Pi:
+    a login shell sees /opt/MVS/lib, a service context sees nothing —
+    which is the difference between the notebook working and the daemon
+    finding no cameras at all.
+
+    This is the POSIX twin of _win_register_runtime_dirs. It only ever
+    FILLS IN a missing value, so an explicit environment still wins.
+    """
+    if os.name == "nt" or os.environ.get("MVCAM_COMMON_RUNENV"):
+        return
+    for root in ("/opt/MVS",):
+        lib = os.path.join(root, "lib")
+        if os.path.isdir(lib):
+            os.environ["MVCAM_COMMON_RUNENV"] = lib
+            os.environ.setdefault("MVCAM_SDK_PATH", root)
+            return
+
+
 # Import the bindings: plain import first (already on PYTHONPATH or
 # vendored next to the caller), then extend sys.path with the known
 # locations and retry. Failure leaves _mv=None — the module stays
 # importable, enumeration returns [], connect() raises actionably.
 _win_register_runtime_dirs()
+_posix_register_runtime_dirs()
 try:
     import MvCameraControl_class as _mv
     _MVS_ERR = None
@@ -152,6 +184,26 @@ except Exception:
     except Exception as _ex:      # ImportError or missing runtime library
         _mv = None
         _MVS_ERR = str(_ex)
+
+
+_SDK_WARNED = False
+
+
+def _warn_sdk_missing():
+    """Say once why there is no SDK. Once, not every call: enumeration
+    runs in polling loops."""
+    global _SDK_WARNED
+    if _SDK_WARNED:
+        return
+    _SDK_WARNED = True
+    sys.stderr.write(
+        "camera.HikRobot: MVS runtime not loaded, so no GigE camera can be "
+        "found (this is NOT a cabling or network problem).\n"
+        f"  reason: {_MVS_ERR}\n"
+        "  fix:    install the vendored runtime — see mvs/README.md\n"
+        "          (a Jupyter kernel started before the install must be "
+        "restarted)\n"
+    )
 
 
 _MV_INIT_LOCK = threading.Lock()
@@ -359,7 +411,14 @@ class HikRobot(Helper):
     @staticmethod
     def all_device():
         """Attached Hikrobot GigE devices: [{serial_number, name,
-        user_name, ip, camera_type}]. Empty when the SDK is absent."""
+        user_name, ip, camera_type}]. Empty when the SDK is absent —
+        and it SAYS SO, once, rather than looking like "no cameras
+        attached". The two are indistinguishable to the caller and lead
+        to completely different fixes: install the runtime, versus check
+        the cable. Measured cost of not saying it: a bench session spent
+        on a camera that pinged fine the whole time."""
+        if _mv is None:
+            _warn_sdk_missing()
         return [d for _, d in HikRobot._enum_raw()]
 
     # ── Connect / close ──────────────────────────────────────────────
