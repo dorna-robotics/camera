@@ -20,6 +20,13 @@ Differences from the D405, stated instead of papered over:
   UDP broadcast discovery on the local segment; a device that is
   streaming still answers discovery, so the presence monitor works
   while we hold the camera open (unlike the uEye daemon quirk).
+- **Addressing is self-healing.** Discovery finds a camera on any
+  subnet, opening needs one this host can route to. A camera stranded
+  on 169.254.x (DHCP unanswered at boot — PoE brings the camera up
+  before the router) is Force-IP'd to the ``ip=`` the caller gave and
+  opened there. Volatile by design: the next power cycle lets DHCP (and
+  a router reservation) win again — so keep cameras factory-default
+  and put the address in the project config + router, not the camera.
 - **Intrinsics are authored or nominal.** A C-mount body takes an
   interchangeable lens, so there is no meaningful factory pinhole to
   ship as a default. Author ``K``/``D``/``native_res`` in ``camera_cfg``
@@ -134,11 +141,43 @@ def _win_register_runtime_dirs():
                 os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
 
 
+def _posix_register_runtime_dirs():
+    """Make the runtime findable in a process that never sourced a login
+    shell — a systemd service, cron, a Jupyter kernel launched from a
+    desktop session.
+
+    THE LINUX MVS INSTALLER EXPORTS ITS ENV FROM /etc/profile, which
+    only LOGIN shells read. The vendored bindings build their library
+    path as::
+
+        os.getenv("MVCAM_COMMON_RUNENV") + "/aarch64/libMvCameraControl.so"
+
+    so with the variable unset that is ``None + str`` -> TypeError, the
+    import fails, and enumeration returns [] on a machine where the SDK
+    is installed and the camera is pingable. Measured on a vision Pi:
+    a login shell sees /opt/MVS/lib, a service context sees nothing —
+    which is the difference between the notebook working and the daemon
+    finding no cameras at all.
+
+    This is the POSIX twin of _win_register_runtime_dirs. It only ever
+    FILLS IN a missing value, so an explicit environment still wins.
+    """
+    if os.name == "nt" or os.environ.get("MVCAM_COMMON_RUNENV"):
+        return
+    for root in ("/opt/MVS",):
+        lib = os.path.join(root, "lib")
+        if os.path.isdir(lib):
+            os.environ["MVCAM_COMMON_RUNENV"] = lib
+            os.environ.setdefault("MVCAM_SDK_PATH", root)
+            return
+
+
 # Import the bindings: plain import first (already on PYTHONPATH or
 # vendored next to the caller), then extend sys.path with the known
 # locations and retry. Failure leaves _mv=None — the module stays
 # importable, enumeration returns [], connect() raises actionably.
 _win_register_runtime_dirs()
+_posix_register_runtime_dirs()
 try:
     import MvCameraControl_class as _mv
     _MVS_ERR = None
@@ -152,6 +191,26 @@ except Exception:
     except Exception as _ex:      # ImportError or missing runtime library
         _mv = None
         _MVS_ERR = str(_ex)
+
+
+_SDK_WARNED = False
+
+
+def _warn_sdk_missing():
+    """Say once why there is no SDK. Once, not every call: enumeration
+    runs in polling loops."""
+    global _SDK_WARNED
+    if _SDK_WARNED:
+        return
+    _SDK_WARNED = True
+    sys.stderr.write(
+        "camera.HikRobot: MVS runtime not loaded, so no GigE camera can be "
+        "found (this is NOT a cabling or network problem).\n"
+        f"  reason: {_MVS_ERR}\n"
+        "  fix:    install the vendored runtime — see mvs/README.md\n"
+        "          (a Jupyter kernel started before the install must be "
+        "restarted)\n"
+    )
 
 
 _MV_INIT_LOCK = threading.Lock()
@@ -196,6 +255,26 @@ def _local_ip_for(dst_ip):
         return s.getsockname()[0]
     finally:
         s.close()
+
+
+def _nic_mask_for(nic_ip):
+    """Netmask (host-order int) of the local NIC holding ``nic_ip``, read
+    from the OS (Linux ``ip -o -4 addr``). /24 when it cannot be read —
+    right for every bench and PoE segment seen so far, and the only
+    thing it feeds is a same-subnet test plus a volatile Force-IP."""
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+                             capture_output=True, text=True,
+                             timeout=3).stdout
+        for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", out):
+            if m.group(1) == nic_ip:
+                plen = int(m.group(2))
+                return (0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF
+    except Exception:
+        pass
+    return 0xFFFFFF00
 
 
 def _ping(ip, timeout_s=1):
@@ -359,7 +438,14 @@ class HikRobot(Helper):
     @staticmethod
     def all_device():
         """Attached Hikrobot GigE devices: [{serial_number, name,
-        user_name, ip, camera_type}]. Empty when the SDK is absent."""
+        user_name, ip, camera_type}]. Empty when the SDK is absent —
+        and it SAYS SO, once, rather than looking like "no cameras
+        attached". The two are indistinguishable to the caller and lead
+        to completely different fixes: install the runtime, versus check
+        the cable. Measured cost of not saying it: a bench session spent
+        on a camera that pinged fine the whole time."""
+        if _mv is None:
+            _warn_sdk_missing()
         return [d for _, d in HikRobot._enum_raw()]
 
     # ── Connect / close ──────────────────────────────────────────────
@@ -425,6 +511,14 @@ class HikRobot(Helper):
         self._cross_subnet = False
         if match:
             dev_struct, dev = match[0]
+            try:
+                dev_struct, dev = self._ensure_routable(dev_struct, dev, ip)
+            except Exception as ex:
+                msg = f"Hikrobot connect failed: {ex}"
+                self._set_state("down", msg)
+                if raise_on_fail:
+                    raise RuntimeError(msg)
+                return False
             self.serial_number = dev["serial_number"]
             self.ip = dev["ip"]
         elif ip and _ping(str(ip)):
@@ -501,6 +595,13 @@ class HikRobot(Helper):
             raise RuntimeError(f"GetFloatValue({key}) failed")
         return float(v.fCurValue)
 
+    def _get_enum(self, key):
+        v = _mv.MVCC_ENUMVALUE()
+        ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
+        if self._cam.MV_CC_GetEnumValue(key, v) != 0:
+            raise RuntimeError(f"GetEnumValue({key}) failed")
+        return int(v.nCurValue)
+
     def _read_string(self, key):
         v = _mv.MVCC_STRINGVALUE()
         ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
@@ -524,6 +625,136 @@ class HikRobot(Helper):
             pass
         return st
 
+    def _ensure_routable(self, dev_struct, dev, want_ip):
+        """Make a discovered camera openable — returns the (struct, dict)
+        to open, unchanged when it already is.
+
+        Discovery is a broadcast, so it finds a camera on ANY subnet;
+        OpenDevice is unicast and needs an address this host can route
+        to. A factory-default camera whose DHCP request went unanswered
+        (the PoE switch powers it seconds after mains, the router takes
+        a minute to boot) sits on 169.254.x.x: discovered, unopenable,
+        and the SDK reports that as MV_E_UDP_RECV_DATA — the same code
+        as "another host holds it". Measured cost of not handling it: a
+        bench session chasing a phantom second host.
+
+        So: camera off this NIC's subnet -> Force-IP it to the address
+        the caller asked for, then re-discover it there. Force-IP is
+        VOLATILE on purpose: the next power cycle gives DHCP another
+        chance, so a router reservation still wins whenever it works
+        (and the camera shows up in the router's client list); this is
+        the safety net, not the addressing plan."""
+        g = dev_struct.SpecialInfo.stGigEInfo
+        nic_ip, cam_ip = int(g.nNetExport), int(g.nCurrentIp)
+        if not nic_ip:
+            return dev_struct, dev
+        mask = _nic_mask_for(_ip_to_str(nic_ip))
+        if (cam_ip & mask) == (nic_ip & mask):
+            return dev_struct, dev
+        sn = dev["serial_number"]
+        subnet = f"{_ip_to_str(nic_ip & mask)}/{_ip_to_str(mask)}"
+        if not want_ip:
+            raise RuntimeError(
+                f"camera {sn} is at {dev['ip']}, not on this host's subnet "
+                f"({subnet}), so it cannot be opened — pass ip=<address on "
+                f"that subnet> to move it there, or give it a DHCP "
+                f"reservation / persistent IP")
+        want_ip = str(want_ip)
+        if (_ip_to_int(want_ip) & mask) != (nic_ip & mask):
+            raise RuntimeError(
+                f"camera {sn} is at {dev['ip']} and the requested ip="
+                f"{want_ip} is not on this host's subnet ({subnet}) either")
+        if _ping(want_ip):
+            raise RuntimeError(
+                f"camera {sn} is at {dev['ip']} (unreachable) and {want_ip} "
+                f"already answers — another device holds that address")
+        dev_struct, dev = self._force_ip(dev_struct, dev, want_ip, mask)
+        return self._reboot_for_dhcp(dev_struct, dev, want_ip, mask, nic_ip)
+
+    def _find(self, sn):
+        """(struct, dict) for serial ``sn`` in discovery right now, or None."""
+        for s, d in self._enum_raw():
+            if d["serial_number"] == sn:
+                return s, d
+        return None
+
+    def _force_ip(self, dev_struct, dev, want_ip, mask):
+        """GigE Force-IP (volatile) to ``want_ip``, then re-discover the
+        camera there — the SDK needs a struct that carries the NEW
+        address to open it."""
+        cam = _mv.MvCamera()
+        try:
+            ret = cam.MV_CC_CreateHandle(dev_struct)
+            if ret == 0:
+                ret = cam.MV_GIGE_ForceIpEx(_ip_to_int(want_ip), mask, 0)
+        finally:
+            try:
+                cam.MV_CC_DestroyHandle()
+            except Exception:
+                pass
+        if ret != 0:
+            raise RuntimeError(
+                f"Force-IP {dev['ip']} -> {want_ip} failed ({_err(ret)})")
+        sn = dev["serial_number"]
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            time.sleep(0.5)
+            found = self._find(sn)
+            if found and found[1]["ip"] == want_ip:
+                return found
+        raise RuntimeError(
+            f"Force-IP {dev['ip']} -> {want_ip} accepted but camera {sn} "
+            f"did not reappear there")
+
+    def _reboot_for_dhcp(self, dev_struct, dev, want_ip, mask, nic_ip):
+        """Hand a Force-IP'd camera back to the router.
+
+        A camera rescued by Force-IP works, but holds no DHCP lease: the
+        router never lists it and the reservation never applies until
+        the next power cycle. The reason it was stranded — the router
+        was still booting when the PoE switch powered the camera — has
+        passed by the time anyone calls connect(), so reboot it now that
+        we can talk to it: it asks DHCP again, gets its reserved
+        address, and we open it there. Comes back on 169.254.x anyway
+        (DHCP genuinely unanswered at this site)? Force-IP once more and
+        proceed — no second reset, so this can never loop. Cost: ~15 s,
+        only on the stranded path."""
+        sn = dev["serial_number"]
+        cam = _mv.MvCamera()
+        try:
+            ok = (cam.MV_CC_CreateHandle(dev_struct) == 0
+                  and cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0) == 0
+                  and cam.MV_CC_SetCommandValue("DeviceReset") == 0)
+        except Exception:
+            ok = False
+        finally:
+            for f in (cam.MV_CC_CloseDevice, cam.MV_CC_DestroyHandle):
+                try:
+                    f()
+                except Exception:
+                    pass
+        if not ok:
+            return dev_struct, dev          # forced address works; keep it
+        # Discovery keeps answering for the old entry for a beat after
+        # the reset — wait for the silence before waiting for the return.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and self._find(sn):
+            time.sleep(0.5)
+        deadline = time.time() + 45.0
+        found = None
+        while time.time() < deadline and not found:
+            time.sleep(0.5)
+            found = self._find(sn)
+        if not found:
+            raise RuntimeError(
+                f"camera {sn} rebooted (to re-acquire DHCP after Force-IP "
+                f"{want_ip}) but did not come back — check PoE power")
+        s, d = found
+        cam_ip = int(s.SpecialInfo.stGigEInfo.nCurrentIp)
+        if (cam_ip & mask) == (nic_ip & mask):
+            return s, d                     # real lease — router lists it
+        return self._force_ip(s, d, want_ip, mask)
+
     def _present(self):
         """Is the camera visible right now? Broadcast discovery first,
         ICMP ping as the fallback — always, not just cross-subnet:
@@ -545,10 +776,19 @@ class HikRobot(Helper):
         self._cam = cam
         ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
         if ret != 0:
-            # exclusive GigE control — a second host/process cannot open it
+            # exclusive GigE control — a second host/process cannot open
+            # it, and the camera says so (ACCESS_DENIED). Anything else
+            # is the control channel not answering: unreachable address,
+            # or a stale session lease from an abnormal close (~3 s).
+            denied = getattr(_mv, "MV_E_ACCESS_DENIED", 0x80000203)
+            if (ret & 0xFFFFFFFF) == (denied & 0xFFFFFFFF):
+                hint = "another process/host is holding the camera"
+            else:
+                hint = ("no reply on the control channel — camera "
+                        "unreachable from this host, or a previous "
+                        "session's lease has not expired yet")
             raise RuntimeError(
-                f"MV_CC_OpenDevice failed ({_err(ret)}) — "
-                f"is another process/host holding the camera?")
+                f"MV_CC_OpenDevice failed ({_err(ret)}) — {hint}")
 
         # GVCP robustness — must be set AFTER open (verified: pre-open
         # calls return OK but don't take effect). Retries keep one lost
@@ -605,6 +845,27 @@ class HikRobot(Helper):
                 cam.MV_CC_SetEnumValue(key, bin_val)
             except Exception:
                 pass
+        # NEVER SILENTLY RUN AT A GEOMETRY THE CALLER DID NOT ASK FOR.
+        # A rejected binning leaves the register at whatever the LAST
+        # session set, so asking for 4 on a sensor that tops out at 2
+        # used to hand back a 2-binned image that looked perfectly
+        # healthy — and every ROI authored against the expected geometry
+        # silently addressed the wrong pixels. Resolution is a contract,
+        # not a preference: fail loudly instead.
+        if getattr(self, "_binning", None):
+            actual_bin = []
+            for key in ("BinningHorizontal", "BinningVertical"):
+                try:
+                    actual_bin.append(self._get_enum(key))
+                except Exception:
+                    actual_bin.append(None)
+            if any(b != bin_val for b in actual_bin if b is not None):
+                raise RuntimeError(
+                    "binning=%d not applied by this sensor (it reports "
+                    "H=%s V=%s). Pick a binning the camera supports — "
+                    "running at a different geometry than requested would "
+                    "silently move every ROI."
+                    % (bin_val, actual_bin[0], actual_bin[1]))
         if not (stream and stream.get("width")):
             try:
                 cam.MV_CC_SetIntValue("Width", self._get_int("WidthMax"))
@@ -647,6 +908,23 @@ class HikRobot(Helper):
         self.stream = {"width": self.width, "height": self.height,
                        "fps": actual_fps}
         self.stream_actual = dict(self.stream)
+
+        # Same contract for an explicitly requested width/height. Sensors
+        # have step constraints, so a request can land on a neighbouring
+        # legal value — which is exactly the silent geometry change that
+        # invalidates authored ROIs. fps is NOT checked: a frame-rate cap
+        # the sensor cannot meet costs throughput, not pixel coordinates.
+        if stream:
+            want_w, want_h = stream.get("width"), stream.get("height")
+            if (want_w and int(want_w) != self.width) or \
+               (want_h and int(want_h) != self.height):
+                raise RuntimeError(
+                    "stream %sx%s not applied — the camera is running at "
+                    "%dx%d. Sensor step constraints can round a request to "
+                    "a neighbouring legal size; accepting that silently "
+                    "would move every ROI authored against the requested "
+                    "geometry."
+                    % (want_w, want_h, self.width, self.height))
 
         # exposure: manual (µs) pins ExposureAuto=Off; None = continuous auto
         if exposure is not None:
@@ -919,7 +1197,7 @@ class HikRobot(Helper):
                          if d["serial_number"] == self.serial_number
                          or (self.ip and d["ip"] == self.ip)]
                 if match:
-                    st = match[0][0]
+                    st, _ = self._ensure_routable(*match[0], self.ip)
                 elif self.ip and _ping(self.ip):
                     st = self._device_info_for_ip(self.ip)
                 else:
