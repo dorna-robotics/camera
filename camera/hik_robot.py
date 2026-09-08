@@ -1115,12 +1115,12 @@ class HikRobot(Helper):
         # first real capture is already settled; afterwards every capture
         # nudges them one step (fixed exposure/gain in the config makes
         # this moot — and is the better practice for detection anyway).
-        # 30 is the cap, not the cost: _warmup stops as soon as the
-        # readback holds still, typically ~10 frames; a dark scene with
-        # a long exposure climb is what the headroom is for.
+        # Adaptive: stops when the image itself stops changing, so a
+        # warm camera costs ~4 frames and a cold dark boot gets the ~24
+        # it was measured to need; capped at 40 frames / 8 s wall-clock.
         if self._acquisition != "continuous" and (
                 exposure is None or gain is None or not wb or wb.get("auto")):
-            self._warmup(30)
+            self._warmup()
 
         # intrinsics: authored (scaled from native_res) else nominal
         # placeholder — a C-mount lens is interchangeable, so there is no
@@ -1362,52 +1362,91 @@ class HikRobot(Helper):
         if ret != 0:
             raise RuntimeError(f"TriggerSoftware failed ({_err(ret)})")
 
-    def _warmup(self, n):
-        """Trigger+grab rounds, frames discarded (raw buffer path, no
-        conversion), until the auto algorithms hold still or ``n``
-        rounds pass. Convergence is read back from the camera —
-        ExposureTime/Gain within 2% over three consecutive frames, and
-        at least 6 frames total so auto white balance (whose ratios we
-        don't poll) gets a floor. A missed grab does NOT abort the
-        burst: the first grab after StartGrabbing routinely times out
-        while the GigE stream channel finishes coming up, and bailing
-        there is how a "warmed-up" connect still hands the caller a
-        black first frame — only three consecutive misses give up.
-        Best effort: a failure here is not a failed connect — the
-        verification grab that follows decides that."""
-        misses = steady = 0
-        last = None
-        for i in range(int(n)):
-            try:
+    def _frame_mean(self, fr):
+        """Mean of a discarded frame's raw payload bytes — brightness.
+        Byte-mean of a packed 10/12-bit or Bayer buffer is not photometric,
+        but warm-up only compares consecutive frames of the SAME format,
+        where it moves with the scene. Subsampled (~64k bytes) so a 6 MB
+        frame costs microseconds. None when the buffer can't be read."""
+        try:
+            info = fr.stFrameInfo
+            size = int(getattr(info, "nFrameLenEx", 0) or info.nFrameLen)
+            if size <= 0 or not fr.pBufAddr:
+                return None
+            buf = ctypes.string_at(fr.pBufAddr, size)
+            step = max(1, size // 65536)
+            return float(np.frombuffer(buf, np.uint8)[::step].mean())
+        except Exception:
+            return None
+
+    def _warmup(self, n=40, deadline_s=8.0):
+        """Adaptive warm-up: trigger+grab rounds, frames discarded, until
+        the image settles — as many frames as the scene needs, no more.
+        The settle signal is each frame's mean brightness (it captures
+        exposure AND gain converging, no feature reads): steady within
+        max(1%, 2 gray levels) for 3 consecutive frames. No brightness →
+        ExposureTime readback within 2% for 3 frames; no signal at all →
+        a fixed 12 frames. A warm camera exits in ~4 frames; a cold dark
+        boot gets the ~24 it was measured to need (MV-CU060-10GC).
+
+        Cannot hang, cannot fail the connect: hard-capped at ``n`` frames
+        AND ``deadline_s`` wall-clock (each grab's own timeout is 2 s, so
+        the frame cap alone would let a stalled stream spin for 80 s);
+        any exception returns quietly; every grabbed buffer is freed. A
+        grab timeout BEFORE the first frame is routine — the GigE stream
+        channel is still coming up after StartGrabbing, and bailing there
+        is how a "warmed-up" connect still hands the caller a black first
+        frame — so up to 3 of those are retried; a miss AFTER frames have
+        flowed is a dead stream and stops the burst at once. Best effort:
+        the verification grab that follows decides the connect."""
+        try:
+            deadline = time.monotonic() + float(deadline_s)
+            steady = blind = misses = frames = 0
+            last_kind = last_val = None
+            for _ in range(int(n)):
+                if time.monotonic() >= deadline:
+                    return
                 self._trigger()
                 fr = _mv.MV_FRAME_OUT()
                 ctypes.memset(ctypes.byref(fr), 0, ctypes.sizeof(fr))
                 if self._cam.MV_CC_GetImageBuffer(fr, 2000) != 0:
                     misses += 1
-                    if misses >= 3:
+                    if frames or misses >= 3:
+                        return          # dead stream — stop asking
+                    continue            # stream still coming up
+                try:
+                    val = self._frame_mean(fr)
+                finally:
+                    try:
+                        self._cam.MV_CC_FreeImageBuffer(fr)
+                    except Exception:
+                        pass
+                frames += 1
+                misses = 0
+                kind = "mean"
+                if val is None:
+                    kind = "expo"
+                    try:
+                        val = self._get_float("ExposureTime")
+                    except Exception:
+                        val = None
+                if val is None:
+                    blind += 1          # no signal: run the fixed count
+                    if blind >= 12:
                         return
                     continue
-                self._cam.MV_CC_FreeImageBuffer(fr)
-            except Exception:
-                return
-            misses = 0
-            now = []
-            for node in ("ExposureTime", "Gain"):
-                try:
-                    now.append(self._get_float(node))
-                except Exception:
-                    pass   # mono/entry models without the node
-            if not now:
-                continue   # no readback — run the full count
-            if last is not None and len(now) == len(last) and all(
-                    abs(a - b) <= 0.02 * max(abs(b), 1e-6)
-                    for a, b in zip(now, last)):
-                steady += 1
-                if steady >= 3 and i >= 5:
-                    return
-            else:
-                steady = 0
-            last = now
+                tol = (max(2.0, 0.01 * last_val) if kind == "mean"
+                       else 0.02 * max(last_val, 1e-6)) \
+                    if kind == last_kind else None
+                if tol is not None and abs(val - last_val) <= tol:
+                    steady += 1
+                    if steady >= 3:
+                        return
+                else:
+                    steady = 0
+                last_kind, last_val = kind, val
+        except Exception:
+            pass
 
     def net_stats(self):
         """Stream health from the SDK's receiver: {"recv_frames",

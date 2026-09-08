@@ -386,7 +386,7 @@ def warming(monkeypatch):
     class FloatVal(ctypes.Structure):
         _fields_ = [("fCurValue", ctypes.c_float)]
 
-    log = SimpleNamespace(triggers=0, grabs=[], exposures=[])
+    log = SimpleNamespace(triggers=0, frees=0, grabs=[], exposures=[])
 
     class FakeCam:
         def MV_CC_ClearImageBuffer(self):
@@ -401,6 +401,7 @@ def warming(monkeypatch):
             return log.grabs.pop(0) if log.grabs else 0
 
         def MV_CC_FreeImageBuffer(self, fr):
+            log.frees += 1
             return 0
 
         def MV_CC_GetFloatValue(self, key, v):
@@ -419,28 +420,103 @@ def warming(monkeypatch):
     return c, log
 
 
+def _unstable_mean():
+    """A _frame_mean stand-in whose brightness never settles."""
+    flip = [0]
+
+    def mean(self, fr):
+        flip[0] ^= 1
+        return 200.0 if flip[0] else 10.0
+    return mean
+
+
+def test_warmup_converges_early_on_a_stable_scene(warming, monkeypatch):
+    # Warm camera, auto already settled: 1 baseline + 3 steady frames.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", lambda self, fr: 120.0)
+    c._warmup()
+    assert log.triggers == 4
+
+
+def test_warmup_rides_the_ramp_and_stops_at_the_plateau(warming, monkeypatch):
+    # Cold dark boot: brightness climbs frame by frame; the burst keeps
+    # feeding the algorithm through the climb and stops 3 frames into
+    # the plateau — no fixed count involved.
+    c, log = warming
+    means = [10, 30, 60, 90, 110, 120, 121, 121.5, 122]
+    monkeypatch.setattr(HikRobot, "_frame_mean",
+                        lambda self, fr: means.pop(0) if len(means) > 1 else means[0])
+    c._warmup()
+    assert log.triggers == 9            # 6 climbing + 3 steady
+
+
+def test_warmup_never_exceeds_the_frame_cap(warming, monkeypatch):
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", _unstable_mean())
+    c._warmup()
+    assert log.triggers == 40           # exactly the cap, never more
+
+
+def test_warmup_stops_on_the_wall_clock_deadline(warming, monkeypatch):
+    # Slow grabs: the 8 s wall clock stops the burst long before the
+    # 40-frame cap would. Fake clock — 2 "seconds" per look.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", _unstable_mean())
+    clock = [0.0]
+
+    def monotonic():
+        clock[0] += 2.0
+        return clock[0] - 2.0
+    monkeypatch.setattr(hik.time, "monotonic", monotonic)
+    c._warmup()
+    assert 0 < log.triggers <= 4        # deadline, not the frame cap
+
+
 def test_warmup_survives_the_first_grab_timeout(warming):
     # The first grab after StartGrabbing routinely times out while the
     # GigE stream channel comes up. That used to abort the whole burst
-    # (0 warm-up frames -> black first capture); now it keeps going.
+    # (0 warm-up frames -> black first capture); it must keep going.
     c, log = warming
     log.grabs = [0x80000007]            # miss once, then frames
-    c._warmup(30)
-    assert log.triggers >= 6            # burst ran past the miss
+    c._warmup()
+    assert log.triggers == 5            # miss + baseline + 3 steady
 
 
-def test_warmup_stops_when_exposure_holds_still(warming):
+def test_warmup_grab_error_after_frames_stops_at_once(warming, monkeypatch):
+    # Once frames have flowed, a miss means the stream died mid-burst:
+    # stop immediately, don't spin 2 s timeouts on it. Every grabbed
+    # buffer was freed, the miss freed nothing.
     c, log = warming
-    log.exposures = [1000, 2000, 4000, 8000, 9800, 9900, 9950, 9990]
-    c._warmup(30)
-    assert log.triggers == 8            # 3 steady readbacks, not the cap
+    monkeypatch.setattr(HikRobot, "_frame_mean", lambda self, fr: 120.0)
+    log.grabs = [0, 0, 1]
+    c._warmup()
+    assert log.triggers == 3 and log.frees == 2
 
 
 def test_warmup_gives_up_after_three_consecutive_misses(warming):
     c, log = warming
     log.grabs = [1, 1, 1]               # nothing is coming — stop asking
-    c._warmup(30)
+    c._warmup()
     assert log.triggers == 3
+
+
+def test_warmup_stops_when_exposure_holds_still(warming):
+    # No readable brightness (the stub frame has no buffer): falls back
+    # to the ExposureTime readback and stops when IT holds still.
+    c, log = warming
+    log.exposures = [1000, 2000, 4000, 8000, 9800, 9900, 9950, 9990]
+    c._warmup()
+    assert log.triggers == 8            # 3 steady readbacks, not the cap
+
+
+def test_warmup_swallows_sdk_exceptions(warming):
+    c, log = warming
+
+    def boom(fr, timeout_ms):
+        raise RuntimeError("sdk fault")
+    c._cam.MV_CC_GetImageBuffer = boom
+    c._warmup()                         # returns quietly — never raises
+    assert log.triggers == 1
 
 
 def test_nic_mask_falls_back_to_slash_24():
