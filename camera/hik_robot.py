@@ -23,10 +23,12 @@ Differences from the D405, stated instead of papered over:
 - **Addressing is self-healing.** Discovery finds a camera on any
   subnet, opening needs one this host can route to. A camera stranded
   on 169.254.x (DHCP unanswered at boot — PoE brings the camera up
-  before the router) is Force-IP'd to the ``ip=`` the caller gave and
-  opened there. Volatile by design: the next power cycle lets DHCP (and
-  a router reservation) win again — so keep cameras factory-default
-  and put the address in the project config + router, not the camera.
+  before the router) is Force-IP'd to the ``ip=`` the caller gave, or
+  to any free address on the host's subnet when none was given, then
+  rebooted so it asks DHCP again now that the router is up, and opened
+  on the lease it gets (the router's reservation). Nothing is written
+  to the camera — keep cameras factory-default and put the address in
+  the router, not the camera.
 - **Intrinsics are authored or nominal.** A C-mount body takes an
   interchangeable lens, so there is no meaningful factory pinhole to
   ship as a default. Author ``K``/``D``/``native_res`` in ``camera_cfg``
@@ -307,6 +309,29 @@ def _scpd_for(mbps, pkt_bytes, tick_hz, link_mbps=1000):
     return max(0, int(round((period - wire) * tick_hz)))
 
 
+def _dbg(msg):
+    """Rescue tracing to a file when HIK_RESCUE_DEBUG is set — the
+    rescue runs deep inside connect(), where a print is swallowed."""
+    path = os.environ.get("HIK_RESCUE_DEBUG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write("%.3f %s\n" % (time.time(), msg))
+    except Exception:
+        pass
+
+
+# The MVS SDK is not thread-safe across enumerate / create / open: the
+# device list it hands back lives in shared library memory, and a
+# concurrent MV_CC_EnumDevices (every live camera's presence watcher
+# fires one every 3 s) corrupts a CreateHandle/OpenDevice happening on
+# another thread — measured 2026-09-07: with one camera live, rescuing a
+# second failed every OpenDevice. Serialize all three through one gate,
+# held only around the C-calls, never across a sleep or a callback.
+_SDK_GATE = threading.RLock()
+
+
 def _ping(ip, timeout_s=1):
     """One ICMP ping, cross-platform, quiet. Used as the presence probe
     for cross-subnet cameras that broadcast discovery cannot see."""
@@ -448,24 +473,40 @@ class HikRobot(Helper):
             return []
         _mv_ensure_init()
         try:
-            dl = _mv.MV_CC_DEVICE_INFO_LIST()
-            if _mv.MvCamera.MV_CC_EnumDevices(_mv.MV_GIGE_DEVICE, dl) != 0:
-                return []
-            out = []
-            for i in range(int(dl.nDeviceNum)):
-                st = ctypes.cast(dl.pDeviceInfo[i],
-                                 ctypes.POINTER(_mv.MV_CC_DEVICE_INFO)).contents
-                gige = st.SpecialInfo.stGigEInfo
-                out.append((st, {
-                    "serial_number": _cstr(gige.chSerialNumber),
-                    "name": _cstr(gige.chModelName),
-                    "user_name": _cstr(gige.chUserDefinedName),
-                    "ip": _ip_to_str(gige.nCurrentIp),
-                    "camera_type": "hikrobot",
-                }))
+            with _SDK_GATE:
+                dl = _mv.MV_CC_DEVICE_INFO_LIST()
+                if _mv.MvCamera.MV_CC_EnumDevices(_mv.MV_GIGE_DEVICE, dl) != 0:
+                    return []
+                out = HikRobot._enum_copy(dl)
             return out
         except Exception:
             return []
+
+    @staticmethod
+    def _enum_copy(dl):
+        """Copy the SDK's device list into our own structs. Call under
+        _SDK_GATE while ``dl`` is fresh: ``.contents`` is a view into
+        memory the SDK owns and rewrites on the next EnumDevices (every
+        3 s from every live camera's presence watcher), so the struct a
+        caller keeps for CreateHandle MUST be a copy — otherwise the
+        list re-ordering silently turns "camera A's struct" into camera
+        B's, and a Force-IP meant for A moves B (measured 2026-09-07)."""
+        out = []
+        for i in range(int(dl.nDeviceNum)):
+            src = ctypes.cast(dl.pDeviceInfo[i],
+                              ctypes.POINTER(_mv.MV_CC_DEVICE_INFO)).contents
+            st = _mv.MV_CC_DEVICE_INFO()
+            ctypes.memmove(ctypes.byref(st), ctypes.byref(src),
+                           ctypes.sizeof(st))
+            gige = st.SpecialInfo.stGigEInfo
+            out.append((st, {
+                "serial_number": _cstr(gige.chSerialNumber),
+                "name": _cstr(gige.chModelName),
+                "user_name": _cstr(gige.chUserDefinedName),
+                "ip": _ip_to_str(gige.nCurrentIp),
+                "camera_type": "hikrobot",
+            }))
+        return out
 
     @staticmethod
     def all_device():
@@ -701,11 +742,17 @@ class HikRobot(Helper):
         sn = dev["serial_number"]
         subnet = f"{_ip_to_str(nic_ip & mask)}/{_ip_to_str(mask)}"
         if not want_ip:
-            raise RuntimeError(
-                f"camera {sn} is at {dev['ip']}, not on this host's subnet "
-                f"({subnet}), so it cannot be opened — pass ip=<address on "
-                f"that subnet> to move it there, or give it a DHCP "
-                f"reservation / persistent IP")
+            # No address in the config (the GUI's Add sends only the
+            # serial): any FREE address on this subnet will do — it is a
+            # stepping stone. We only need to reach the camera long
+            # enough to reboot it; it then asks DHCP and lands on the
+            # router's reservation, and we open it there.
+            want_ip = self._free_address(nic_ip, mask)
+            if not want_ip:
+                raise RuntimeError(
+                    f"camera {sn} is at {dev['ip']}, not on this host's "
+                    f"subnet ({subnet}), and no free address was found "
+                    f"there to move it to")
         want_ip = str(want_ip)
         if (_ip_to_int(want_ip) & mask) != (nic_ip & mask):
             raise RuntimeError(
@@ -718,6 +765,24 @@ class HikRobot(Helper):
         dev_struct, dev = self._force_ip(dev_struct, dev, want_ip, mask)
         return self._reboot_for_dhcp(dev_struct, dev, want_ip, mask, nic_ip)
 
+    def _free_address(self, nic_ip, mask):
+        """A host address on the NIC's subnet nothing answers on: not
+        the NIC, not the gateway-ish .1, not another discovered camera,
+        and no ping reply. Scanned from the top of the range down, where
+        reservations rarely live. None when the subnet is full."""
+        net = nic_ip & mask
+        size = (~mask) & 0xFFFFFFFF
+        taken = {nic_ip, net | 1} | {
+            _ip_to_int(d["ip"]) for _, d in self._enum_raw()}
+        for host in range(min(size - 1, 250), 1, -1):
+            cand = net | host
+            if cand in taken:
+                continue
+            ip = _ip_to_str(cand)
+            if not _ping(ip):
+                return ip
+        return None
+
     def _find(self, sn):
         """(struct, dict) for serial ``sn`` in discovery right now, or None."""
         for s, d in self._enum_raw():
@@ -729,24 +794,27 @@ class HikRobot(Helper):
         """GigE Force-IP (volatile) to ``want_ip``, then re-discover the
         camera there — the SDK needs a struct that carries the NEW
         address to open it."""
-        cam = _mv.MvCamera()
-        try:
-            ret = cam.MV_CC_CreateHandle(dev_struct)
-            if ret == 0:
-                ret = cam.MV_GIGE_ForceIpEx(_ip_to_int(want_ip), mask, 0)
-        finally:
+        with _SDK_GATE:
+            cam = _mv.MvCamera()
             try:
-                cam.MV_CC_DestroyHandle()
-            except Exception:
-                pass
+                ret = cam.MV_CC_CreateHandle(dev_struct)
+                if ret == 0:
+                    ret = cam.MV_GIGE_ForceIpEx(_ip_to_int(want_ip), mask, 0)
+            finally:
+                try:
+                    cam.MV_CC_DestroyHandle()
+                except Exception:
+                    pass
+        _dbg(f"force {dev['ip']} -> {want_ip} ret={_err(ret)}")
         if ret != 0:
             raise RuntimeError(
                 f"Force-IP {dev['ip']} -> {want_ip} failed ({_err(ret)})")
         sn = dev["serial_number"]
-        deadline = time.time() + 6.0
+        deadline = time.time() + 12.0     # measured: 0.1 s; margin is cheap
         while time.time() < deadline:
             time.sleep(0.5)
             found = self._find(sn)
+            _dbg(f"  rediscover {sn}: {found[1]['ip'] if found else None}")
             if found and found[1]["ip"] == want_ip:
                 return found
         raise RuntimeError(
@@ -767,37 +835,61 @@ class HikRobot(Helper):
         proceed — no second reset, so this can never loop. Cost: ~15 s,
         only on the stranded path."""
         sn = dev["serial_number"]
-        cam = _mv.MvCamera()
-        try:
-            ok = (cam.MV_CC_CreateHandle(dev_struct) == 0
-                  and cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0) == 0
-                  and cam.MV_CC_SetCommandValue("DeviceReset") == 0)
-        except Exception:
-            ok = False
-        finally:
-            for f in (cam.MV_CC_CloseDevice, cam.MV_CC_DestroyHandle):
+        ok = False
+        # A camera answers broadcast discovery on its new Force-IP
+        # address before its unicast GVCP control channel is ready, so
+        # the first OpenDevice here can miss with UDP_RECV_DATA. Give it
+        # a short settle, then retry patiently — the reset is what puts
+        # the camera back on DHCP, so it is worth ~20 s of trying.
+        time.sleep(2.0)
+        for attempt in range(8):
+            with _SDK_GATE:
+                cam = _mv.MvCamera()
+                ropen = rreset = None
                 try:
-                    f()
-                except Exception:
-                    pass
+                    rc = cam.MV_CC_CreateHandle(dev_struct)
+                    if rc == 0:
+                        ropen = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
+                        if ropen == 0:
+                            rreset = cam.MV_CC_SetCommandValue("DeviceReset")
+                    ok = (ropen == 0 and rreset == 0)
+                except Exception as ex:
+                    _dbg(f"  reset attempt {attempt}: exception {ex}")
+                    ok = False
+                finally:
+                    for f in (cam.MV_CC_CloseDevice, cam.MV_CC_DestroyHandle):
+                        try:
+                            f()
+                        except Exception:
+                            pass
+            _dbg(f"  reset attempt {attempt}: ok={ok} "
+                 f"open={_err(ropen) if ropen is not None else None} "
+                 f"reset={_err(rreset) if rreset is not None else None}")
+            if ok:
+                break
+            time.sleep(2.0)
         if not ok:
+            _dbg("reset never succeeded -> keep forced address")
             return dev_struct, dev          # forced address works; keep it
         # Discovery keeps answering for the old entry for a beat after
         # the reset — wait for the silence before waiting for the return.
         deadline = time.time() + 10.0
         while time.time() < deadline and self._find(sn):
             time.sleep(0.5)
+        _dbg(f"post-reset: camera gone from discovery after {time.time()-(deadline-10):.1f}s")
         deadline = time.time() + 45.0
         found = None
         while time.time() < deadline and not found:
             time.sleep(0.5)
             found = self._find(sn)
+        _dbg(f"post-reset: reappeared={bool(found)}")
         if not found:
             raise RuntimeError(
                 f"camera {sn} rebooted (to re-acquire DHCP after Force-IP "
                 f"{want_ip}) but did not come back — check PoE power")
         s, d = found
         cam_ip = int(s.SpecialInfo.stGigEInfo.nCurrentIp)
+        _dbg(f"reappeared at {d['ip']} (on-subnet={(cam_ip & mask) == (nic_ip & mask)})")
         if (cam_ip & mask) == (nic_ip & mask):
             return s, d                     # real lease — router lists it
         return self._force_ip(s, d, want_ip, mask)
@@ -817,11 +909,12 @@ class HikRobot(Helper):
 
     def _open(self, dev_struct, stream, K, D, native_res, exposure, gain, wb):
         cam = _mv.MvCamera()
-        ret = cam.MV_CC_CreateHandle(dev_struct)
-        if ret != 0:
-            raise RuntimeError(f"MV_CC_CreateHandle failed ({_err(ret)})")
-        self._cam = cam
-        ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
+        with _SDK_GATE:
+            ret = cam.MV_CC_CreateHandle(dev_struct)
+            if ret != 0:
+                raise RuntimeError(f"MV_CC_CreateHandle failed ({_err(ret)})")
+            self._cam = cam
+            ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
         if ret != 0:
             # exclusive GigE control — a second host/process cannot open
             # it, and the camera says so (ACCESS_DENIED). Anything else
@@ -1355,9 +1448,10 @@ class HikRobot(Helper):
                 else:
                     raise RuntimeError("device not present")
                 cam = _mv.MvCamera()
-                if cam.MV_CC_CreateHandle(st) != 0:
-                    raise RuntimeError("CreateHandle failed")
-                ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
+                with _SDK_GATE:
+                    if cam.MV_CC_CreateHandle(st) != 0:
+                        raise RuntimeError("CreateHandle failed")
+                    ret = cam.MV_CC_OpenDevice(_mv.MV_ACCESS_Exclusive, 0)
                 if ret != 0:
                     raise RuntimeError(f"quiet open failed ({_err(ret)})")
                 try:

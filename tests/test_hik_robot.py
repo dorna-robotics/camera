@@ -189,8 +189,25 @@ def test_reset_refused_keeps_the_forced_address(stranded):
     assert d["ip"] == "10.0.1.50" and stranded.resets == []
 
 
+def test_no_ip_in_config_uses_a_free_stepping_stone(stranded):
+    # The GUI's Add sends only the serial. Pick a free address, move the
+    # camera there, reboot it, open it on the lease DHCP hands out.
+    stranded.after_reset = "10.0.1.51"          # the router's reservation
+    st, d = _rescue("")
+    assert stranded.forced == [("10.0.1.250", "255.255.255.0")]
+    assert stranded.resets == ["DeviceReset"]
+    assert d["ip"] == "10.0.1.51"
+
+
+def test_free_address_skips_nic_gateway_cameras_and_ping_answers(stranded, monkeypatch):
+    monkeypatch.setattr(hik, "_ping", lambda ip, timeout_s=1: ip in ("10.0.1.250", "10.0.1.249"))
+    monkeypatch.setattr(HikRobot, "_enum_raw", staticmethod(
+        lambda: [(_gige_struct("10.0.1.248"), _dev("10.0.1.248"))]))
+    c = HikRobot()
+    assert c._free_address(hik._ip_to_int("10.0.1.40"), 0xFFFFFF00) == "10.0.1.247"
+
+
 @pytest.mark.parametrize("want, needle", [
-    ("", "pass ip="),                            # nothing to move it to
     ("10.0.2.50", "not on this host's subnet"),  # wrong subnet requested
     ("10.0.1.7", "already answers"),             # address taken (pings)
 ])
