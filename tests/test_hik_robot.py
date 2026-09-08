@@ -371,6 +371,78 @@ def test_refused_trigger_is_fatal_not_transient(armed):
     assert c.state == "down"            # handle released for the rebuild
 
 
+@pytest.fixture
+def warming(monkeypatch):
+    """A grabbing-looking driver for the connect warm-up: the fake cam
+    scripts GetImageBuffer results (0 = a frame, else = a miss) via
+    ``grabs`` and ExposureTime readbacks via ``exposures`` (last value
+    repeats). Triggers land in ``triggers``."""
+    import ctypes
+    from types import SimpleNamespace
+
+    class Frame(ctypes.Structure):
+        _fields_ = [("pad", ctypes.c_uint)]
+
+    class FloatVal(ctypes.Structure):
+        _fields_ = [("fCurValue", ctypes.c_float)]
+
+    log = SimpleNamespace(triggers=0, grabs=[], exposures=[])
+
+    class FakeCam:
+        def MV_CC_ClearImageBuffer(self):
+            return 0
+
+        def MV_CC_SetCommandValue(self, key):
+            assert key == "TriggerSoftware"
+            log.triggers += 1
+            return 0
+
+        def MV_CC_GetImageBuffer(self, fr, timeout_ms):
+            return log.grabs.pop(0) if log.grabs else 0
+
+        def MV_CC_FreeImageBuffer(self, fr):
+            return 0
+
+        def MV_CC_GetFloatValue(self, key, v):
+            if key != "ExposureTime":
+                return -1               # entry model without a Gain node
+            if len(log.exposures) > 1:
+                v.fCurValue = log.exposures.pop(0)
+            else:
+                v.fCurValue = log.exposures[0] if log.exposures else 10000.0
+            return 0
+
+    monkeypatch.setattr(hik, "_mv", SimpleNamespace(
+        MV_FRAME_OUT=Frame, MVCC_FLOATVALUE=FloatVal))
+    c = HikRobot()
+    c._cam = FakeCam()
+    return c, log
+
+
+def test_warmup_survives_the_first_grab_timeout(warming):
+    # The first grab after StartGrabbing routinely times out while the
+    # GigE stream channel comes up. That used to abort the whole burst
+    # (0 warm-up frames -> black first capture); now it keeps going.
+    c, log = warming
+    log.grabs = [0x80000007]            # miss once, then frames
+    c._warmup(30)
+    assert log.triggers >= 6            # burst ran past the miss
+
+
+def test_warmup_stops_when_exposure_holds_still(warming):
+    c, log = warming
+    log.exposures = [1000, 2000, 4000, 8000, 9800, 9900, 9950, 9990]
+    c._warmup(30)
+    assert log.triggers == 8            # 3 steady readbacks, not the cap
+
+
+def test_warmup_gives_up_after_three_consecutive_misses(warming):
+    c, log = warming
+    log.grabs = [1, 1, 1]               # nothing is coming — stop asking
+    c._warmup(30)
+    assert log.triggers == 3
+
+
 def test_nic_mask_falls_back_to_slash_24():
     # a NIC address the OS does not have -> /24, never an exception
     assert hik._nic_mask_for("192.0.2.9") == 0xFFFFFF00

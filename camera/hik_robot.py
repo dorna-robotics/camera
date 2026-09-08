@@ -1115,9 +1115,12 @@ class HikRobot(Helper):
         # first real capture is already settled; afterwards every capture
         # nudges them one step (fixed exposure/gain in the config makes
         # this moot — and is the better practice for detection anyway).
+        # 30 is the cap, not the cost: _warmup stops as soon as the
+        # readback holds still, typically ~10 frames; a dark scene with
+        # a long exposure climb is what the headroom is for.
         if self._acquisition != "continuous" and (
                 exposure is None or gain is None or not wb or wb.get("auto")):
-            self._warmup(12)
+            self._warmup(30)
 
         # intrinsics: authored (scaled from native_res) else nominal
         # placeholder — a C-mount lens is interchangeable, so there is no
@@ -1360,19 +1363,51 @@ class HikRobot(Helper):
             raise RuntimeError(f"TriggerSoftware failed ({_err(ret)})")
 
     def _warmup(self, n):
-        """n trigger+grab rounds, frames discarded (raw buffer path, no
-        conversion). Best effort: a failure here is not a failed connect
-        — the verification grab that follows decides that."""
-        try:
-            for _ in range(int(n)):
+        """Trigger+grab rounds, frames discarded (raw buffer path, no
+        conversion), until the auto algorithms hold still or ``n``
+        rounds pass. Convergence is read back from the camera —
+        ExposureTime/Gain within 2% over three consecutive frames, and
+        at least 6 frames total so auto white balance (whose ratios we
+        don't poll) gets a floor. A missed grab does NOT abort the
+        burst: the first grab after StartGrabbing routinely times out
+        while the GigE stream channel finishes coming up, and bailing
+        there is how a "warmed-up" connect still hands the caller a
+        black first frame — only three consecutive misses give up.
+        Best effort: a failure here is not a failed connect — the
+        verification grab that follows decides that."""
+        misses = steady = 0
+        last = None
+        for i in range(int(n)):
+            try:
                 self._trigger()
                 fr = _mv.MV_FRAME_OUT()
                 ctypes.memset(ctypes.byref(fr), 0, ctypes.sizeof(fr))
                 if self._cam.MV_CC_GetImageBuffer(fr, 2000) != 0:
-                    break
+                    misses += 1
+                    if misses >= 3:
+                        return
+                    continue
                 self._cam.MV_CC_FreeImageBuffer(fr)
-        except Exception:
-            pass
+            except Exception:
+                return
+            misses = 0
+            now = []
+            for node in ("ExposureTime", "Gain"):
+                try:
+                    now.append(self._get_float(node))
+                except Exception:
+                    pass   # mono/entry models without the node
+            if not now:
+                continue   # no readback — run the full count
+            if last is not None and len(now) == len(last) and all(
+                    abs(a - b) <= 0.02 * max(abs(b), 1e-6)
+                    for a, b in zip(now, last)):
+                steady += 1
+                if steady >= 3 and i >= 5:
+                    return
+            else:
+                steady = 0
+            last = now
 
     def net_stats(self):
         """Stream health from the SDK's receiver: {"recv_frames",
