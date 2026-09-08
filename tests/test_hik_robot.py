@@ -203,6 +203,157 @@ def test_stranded_camera_errors_say_why(stranded, want, needle):
     assert stranded.forced == [] and stranded.resets == []   # never on an error path
 
 
+def test_bandwidth_to_packet_delay_matches_bench():
+    # MV-CU060-10GC: 100 MHz tick, 1500 B packets. Bench: 300 Mbps ->
+    # 2770 ticks (6.5 fps, two cameras at 686 Mbps, zero loss).
+    assert hik._scpd_for(300, 1500, 100_000_000) == 2770
+    assert hik._scpd_for(400, 1500, 100_000_000) == 1770
+    assert hik._scpd_for(0, 1500, 100_000_000) == 0        # 0 = unpaced
+    assert hik._scpd_for(None, 1500, 100_000_000) == 0
+    assert hik._scpd_for(5000, 1500, 100_000_000) == 0     # above line rate: no gap
+
+
+def _stall_cam():
+    """A driver instance for the grab-policy tests: never connected, so
+    give it the nominal intrinsics the frame tuple carries."""
+    c = HikRobot()
+    c._nominal = None
+    return c
+
+
+def _grabber(script):
+    """_grab_bgr stand-in: pops one entry per call — "stall" raises the
+    transient error, anything else is returned as the frame."""
+    calls = []
+
+    def grab(self):
+        step = script.pop(0)
+        calls.append(step)
+        if step == "stall":
+            raise hik._TransientGrabError("no frame")
+        return step
+    return grab, calls
+
+
+def test_one_empty_grab_is_transient_not_a_reconnect(monkeypatch):
+    c = _stall_cam()
+    grab, calls = _grabber(["stall"])
+    monkeypatch.setattr(HikRobot, "_grab_bgr", grab)
+    monkeypatch.setattr(c, "recover", lambda: pytest.fail("must not reconnect"))
+    with pytest.raises(hik._TransientGrabError):
+        c.get_all()
+    assert c._stalls == 1
+
+
+def test_two_empty_grabs_in_a_row_rebuild_the_session(monkeypatch):
+    c = _stall_cam()
+    grab, calls = _grabber(["stall", "stall", "frame"])
+    monkeypatch.setattr(HikRobot, "_grab_bgr", grab)
+    monkeypatch.setattr(c, "_present", lambda: True)
+    recovered = []
+    monkeypatch.setattr(c, "recover", lambda: recovered.append(1) or True)
+    with pytest.raises(hik._TransientGrabError):
+        c.get_all()                       # 1st: transient
+    out = c.get_all()                     # 2nd: stall -> recover -> grab
+    assert recovered == [1]
+    assert out[5] == "frame" and c._stalls == 0
+
+
+def test_dead_stream_is_rebuilt_on_the_first_empty_grab(monkeypatch):
+    # SDK receive counter flat across the grab window -> nothing is
+    # arriving -> rebuild now, don't make the user wait for a 2nd capture
+    c = _stall_cam()
+    grab, calls = _grabber(["stall", "frame"])
+    monkeypatch.setattr(HikRobot, "_grab_bgr", grab)
+    monkeypatch.setattr(c, "net_stats", lambda: {"recv_frames": 80})
+    monkeypatch.setattr(c, "_present", lambda: True)
+    recovered = []
+    monkeypatch.setattr(c, "recover", lambda: recovered.append(1) or True)
+    out = c.get_all()
+    assert recovered == [1] and out[5] == "frame" and calls == ["stall", "frame"]
+
+
+def test_lossy_stream_with_frames_arriving_stays_transient(monkeypatch):
+    # counter moving -> frames arrive but none complete -> lossy link,
+    # keep the session (Wi-Fi bench contract)
+    c = _stall_cam()
+    grab, calls = _grabber(["stall"])
+    monkeypatch.setattr(HikRobot, "_grab_bgr", grab)
+    counter = iter([80, 95])
+    monkeypatch.setattr(c, "net_stats", lambda: {"recv_frames": next(counter)})
+    monkeypatch.setattr(c, "recover", lambda: pytest.fail("must not reconnect"))
+    with pytest.raises(hik._TransientGrabError):
+        c.get_all()
+
+
+def test_a_frame_resets_the_stall_count(monkeypatch):
+    c = _stall_cam()
+    grab, calls = _grabber(["stall", "frame", "stall"])
+    monkeypatch.setattr(HikRobot, "_grab_bgr", grab)
+    monkeypatch.setattr(c, "recover", lambda: pytest.fail("must not reconnect"))
+    with pytest.raises(hik._TransientGrabError):
+        c.get_all()
+    c.get_all()
+    with pytest.raises(hik._TransientGrabError):
+        c.get_all()                       # stalls: 1, 0, 1 — never reaches 2
+    assert c._stalls == 1
+
+
+@pytest.fixture
+def armed(monkeypatch):
+    """A connected-looking driver over a stub SDK: the fake camera
+    records trigger commands and answers every read with a 2x2 frame."""
+    import ctypes
+    from types import SimpleNamespace
+
+    class Info(ctypes.Structure):
+        _fields_ = [("nWidth", ctypes.c_uint), ("nHeight", ctypes.c_uint)]
+
+    log = SimpleNamespace(cmds=[], cleared=0)
+
+    class FakeCam:
+        def MV_CC_ClearImageBuffer(self):
+            log.cleared += 1
+            return 0
+
+        def MV_CC_SetCommandValue(self, key):
+            log.cmds.append(key)
+            return 0
+
+        def MV_CC_GetImageForBGR(self, buf, n, info, timeout_ms):
+            info.nWidth, info.nHeight = 2, 2
+            return 0
+
+    monkeypatch.setattr(hik, "_mv", SimpleNamespace(
+        MV_FRAME_OUT_INFO_EX=Info, MV_E_NODATA=0x80000007))
+    c = HikRobot()
+    c._cam, c.width, c.height, c.serial_number = FakeCam(), 2, 2, "SN1"
+    return c, log
+
+
+def test_on_demand_grab_clears_triggers_then_reads(armed):
+    c, log = armed                      # default acquisition: trigger
+    img = c._grab_bgr()
+    assert log.cmds == ["TriggerSoftware"] and log.cleared == 1
+    assert img.shape == (2, 2, 3)
+
+
+def test_continuous_grab_never_triggers(armed):
+    c, log = armed
+    c._acquisition = "continuous"
+    assert c._grab_bgr().shape == (2, 2, 3)
+    assert log.cmds == [] and log.cleared == 0
+
+
+def test_refused_trigger_is_fatal_not_transient(armed):
+    c, log = armed
+    c._cam.MV_CC_SetCommandValue = lambda key: 0x80000203   # session gone
+    with pytest.raises(RuntimeError) as ex:
+        c._grab_bgr()
+    assert not isinstance(ex.value, hik._TransientGrabError)
+    assert c.state == "down"            # handle released for the rebuild
+
+
 def test_nic_mask_falls_back_to_slash_24():
     # a NIC address the OS does not have -> /24, never an exception
     assert hik._nic_mask_for("192.0.2.9") == 0xFFFFFF00

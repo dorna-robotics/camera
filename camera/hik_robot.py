@@ -40,6 +40,19 @@ Differences from the D405, stated instead of papered over:
   camera in continuous auto. ``gain`` (dB) works the same way.
 - **White balance.** ``{"auto": True}`` continuous, ``{"once": True}``
   converge then hold, ``{"hold": True}`` freeze the current ratios.
+- **On demand by default.** ``acquisition="trigger"``: the camera is
+  armed and silent; every grab software-triggers ONE frame, exposed at
+  that moment, and the link carries nothing in between — so any number
+  of cameras share a NIC and every capture is fresh. Auto exposure/WB
+  get a warm-up burst at connect. ``acquisition="continuous"`` is the
+  free-run stream: unpaced, ONE MV-CU060 fills a gigabit link (951
+  Mbps) and the Pi 5 NIC drops frames — pair it with ``bandwidth=``
+  (Mbps), which paces the stream (two cameras share fine at 300–400
+  each).
+- **Dead streams heal.** A grab that brings nothing while the SDK's
+  receive counter stays flat (a link flap made the camera drop its
+  session) rebuilds the session on that same capture. ``net_stats()``
+  reports received/lost frames and packets.
 - **Hotplug.** GigE has no cable-level hotplug callback, so a presence
   monitor polls broadcast discovery every 3 s: two consecutive misses
   (~6 s) → ``down`` and the handle is released; while down, the device
@@ -277,6 +290,23 @@ def _nic_mask_for(nic_ip):
     return 0xFFFFFF00
 
 
+def _scpd_for(mbps, pkt_bytes, tick_hz, link_mbps=1000):
+    """GevSCPD ticks that pace one camera's stream to ``mbps``.
+
+    A GigE camera bursts every frame at line rate no matter how low the
+    fps; the inter-packet delay is the only knob that lowers the PEAK.
+    Per packet: it occupies ``pkt+38`` bytes of wire at link speed, and
+    we want one packet per ``pkt*8/mbps`` seconds — the gap between the
+    two, in camera timestamp ticks, is the delay. Measured on a
+    MV-CU060-10GC (100 MHz tick, 1500 B packets): 300 Mbps -> 2770 ticks
+    -> 6.5 fps and a 686 Mbps link with two cameras, zero loss."""
+    if not mbps or mbps <= 0:
+        return 0
+    wire = (pkt_bytes + 38) * 8.0 / (link_mbps * 1e6)
+    period = pkt_bytes * 8.0 / (mbps * 1e6)
+    return max(0, int(round((period - wire) * tick_hz)))
+
+
 def _ping(ip, timeout_s=1):
     """One ICMP ping, cross-platform, quiet. Used as the presence probe
     for cross-subnet cameras that broadcast discovery cannot see."""
@@ -354,6 +384,8 @@ class HikRobot(Helper):
         self._connect_kwargs = {}
         self._recover_lock = threading.Lock()
         self._cross_subnet = False     # opened by IP across a router?
+        self._stalls = 0               # consecutive no-frame grabs
+        self._acquisition = "trigger"  # see connect()
 
         self.width = 0
         self.height = 0
@@ -464,9 +496,21 @@ class HikRobot(Helper):
         packet_delay=None,    # GevSCPD ticks — paces the stream's packet
                               # bursts for links that can't absorb line-rate
                               # (Wi-Fi bench: ~8000). None = no pacing (wired).
+        bandwidth=None,       # Mbps — the same pacing, stated as a link
+                              # share: SCPD is computed from the camera's
+                              # tick rate + packet size at open. Several
+                              # cameras on one NIC MUST share the link:
+                              # two MV-CU060 unpaced = 975 Mbps and the
+                              # Pi 5 NIC drops frames. packet_delay wins
+                              # when both are given. None = no pacing.
         binning=None,         # 2 or 4 — on-sensor pixel binning: full FOV at
                               # 1/4 (or 1/16) the data per frame. THE fix for
                               # lossy links; also brightens (averaged pixels).
+        acquisition="trigger",  # "trigger": armed and silent, each grab
+                              # software-triggers ONE fresh frame — the
+                              # link is idle between captures, so any
+                              # number of cameras share a NIC. "continuous":
+                              # free-run at max fps (pair with bandwidth=).
         mode="bgr",
         filter={},
         max_tries=3,
@@ -490,10 +534,13 @@ class HikRobot(Helper):
         self._connect_kwargs = dict(
             serial_number=serial_number, ip=ip, stream=stream, K=K, D=D,
             native_res=native_res, exposure=exposure, gain=gain, wb=wb,
-            packet_delay=packet_delay, binning=binning,
+            packet_delay=packet_delay, bandwidth=bandwidth, binning=binning,
+            acquisition=acquisition,
             mode=mode, filter=filter, max_tries=max_tries,
         )
         self._packet_delay = packet_delay
+        self._bandwidth = bandwidth
+        self._acquisition = "continuous" if acquisition == "continuous" else "trigger"
         self._binning = binning
         self.filter = filter
         self.mode = mode
@@ -817,11 +864,19 @@ class HikRobot(Helper):
         # option is not requested, actively restore the full-speed
         # default, or yesterday's Wi-Fi throttle silently survives into
         # today's wired session.
+        scpd = getattr(self, "_packet_delay", None)
+        if scpd is None and getattr(self, "_bandwidth", None):
+            try:
+                scpd = _scpd_for(float(self._bandwidth),
+                                 self._get_int("GevSCPSPacketSize"),
+                                 self._get_int("GevTimestampTickFrequency"))
+            except Exception:
+                scpd = None            # node missing: run unpaced, say so
         try:
-            cam.MV_CC_SetIntValue(
-                "GevSCPD", int(getattr(self, "_packet_delay", None) or 0))
+            cam.MV_CC_SetIntValue("GevSCPD", int(scpd or 0))
         except Exception:
             pass
+        self.packet_delay_actual = int(scpd or 0)
 
         # Packet resend — re-request lost stream packets instead of
         # discarding the whole frame. The difference between "mostly
@@ -873,8 +928,18 @@ class HikRobot(Helper):
             except Exception:
                 pass
 
-        # free-run, no trigger
-        cam.MV_CC_SetEnumValue("TriggerMode", _mv.MV_TRIGGER_MODE_OFF)
+        # Acquisition: on demand (default) or free-run. Registers persist
+        # across sessions, so BOTH branches set the mode explicitly.
+        if self._acquisition == "continuous":
+            cam.MV_CC_SetEnumValue("TriggerMode", _mv.MV_TRIGGER_MODE_OFF)
+        else:
+            for key, val in (("TriggerMode", _mv.MV_TRIGGER_MODE_ON),
+                             ("TriggerSource", _mv.MV_TRIGGER_SOURCE_SOFTWARE)):
+                ret = cam.MV_CC_SetEnumValue(key, val)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"{key} for on-demand acquisition refused "
+                        f"({_err(ret)}) — pass acquisition=\"continuous\"")
 
         # stream config — best-effort: sensors have step constraints, so
         # every set is attempted and the ACTUALS are read back (honest
@@ -905,6 +970,8 @@ class HikRobot(Helper):
             actual_fps = round(self._get_float("ResultingFrameRate"), 2)
         except Exception:
             actual_fps = None
+        if self._acquisition != "continuous":
+            actual_fps = None          # on demand: there is no rate
         self.stream = {"width": self.width, "height": self.height,
                        "fps": actual_fps}
         self.stream_actual = dict(self.stream)
@@ -949,6 +1016,15 @@ class HikRobot(Helper):
         ret = cam.MV_CC_StartGrabbing()
         if ret != 0:
             raise RuntimeError(f"MV_CC_StartGrabbing failed ({_err(ret)})")
+
+        # On demand + auto exposure/WB: the algorithms converge on frames
+        # they never see between captures. Feed them a burst now so the
+        # first real capture is already settled; afterwards every capture
+        # nudges them one step (fixed exposure/gain in the config makes
+        # this moot — and is the better practice for detection anyway).
+        if self._acquisition != "continuous" and (
+                exposure is None or gain is None or not wb or wb.get("auto")):
+            self._warmup(12)
 
         # intrinsics: authored (scaled from native_res) else nominal
         # placeholder — a C-mount lens is interchangeable, so there is no
@@ -1107,6 +1183,8 @@ class HikRobot(Helper):
                     ctypes.memset(self._buf, 0, n)
                 last = 0
                 for _ in range(max(1, retries + 1)):
+                    if self._acquisition != "continuous":
+                        self._trigger()
                     info = _mv.MV_FRAME_OUT_INFO_EX()
                     ctypes.memset(ctypes.byref(info), 0, ctypes.sizeof(info))
                     ret = self._cam.MV_CC_GetImageForBGR(
@@ -1123,9 +1201,9 @@ class HikRobot(Helper):
                 # NODATA through all retries: transient starvation, the
                 # session itself is healthy — do NOT tear it down.
                 raise _TransientGrabError(
-                    f"no complete frame within {timeout_ms}ms x"
-                    f"{retries + 1} tries ({_err(last)}) — lossy link? "
-                    f"retry, lower fps, or set packet_delay")
+                    f"{self.serial_number}: no complete frame within "
+                    f"{timeout_ms}ms x{retries + 1} tries ({_err(last)}) — "
+                    f"lossy link? retry, lower fps, or set bandwidth")
             except _TransientGrabError:
                 raise
             except Exception as ex:
@@ -1136,10 +1214,31 @@ class HikRobot(Helper):
     def get_all(self, align_to=None, alpha=None):
         """Same 9-tuple as Camera.get_all — depth/ir slots are None
         (color-only device); depth_int is the effective intrinsics."""
+        before = self.net_stats().get("recv_frames")
         try:
             color_img = self._grab_bgr()
+            self._stalls = 0
         except _TransientGrabError:
-            raise            # session healthy, caller just retries
+            # Empty grab. Lossy link (frames arriving, none complete) or
+            # DEAD STREAM? Measured 2026-09-07: a link flap longer than
+            # the camera's heartbeat timeout makes the camera drop the
+            # control session and STOP streaming, while the SDK still
+            # reports it connected and discovery still sees it — so
+            # every capture answered NODATA for as long as anyone tried,
+            # because nothing ever rebuilt the session. Tell the two
+            # apart by the SDK's receive counter: no frame at all
+            # during the whole grab window = dead -> rebuild now. When
+            # the counter is unavailable, two empty grabs in a row
+            # (30 s) count as dead.
+            after = self.net_stats().get("recv_frames")
+            dead = before is not None and after == before
+            self._stalls += 1
+            if not (dead or self._stalls >= 2):
+                raise                       # lossy: session fine, retry
+            if not (self._present() and self.recover()):
+                raise
+            self._stalls = 0
+            color_img = self._grab_bgr()
         except Exception:
             # Fatal grab failure. On lossy links the SDK latches the
             # device DISCONNECTED after one lost control reply (its own
@@ -1153,6 +1252,59 @@ class HikRobot(Helper):
         depth_int = self.intr if self.intr is not None else self._nominal
         return (None, None, None, None, None, color_img, depth_int,
                 None, time.time())
+
+    def _trigger(self):
+        """Fire one software trigger. The SDK buffer is cleared first: a
+        frame from an earlier trigger nobody collected must not pass as
+        the fresh one. A refused trigger is a dead control channel, not
+        a lossy link — let it surface as fatal so the session rebuilds."""
+        try:
+            self._cam.MV_CC_ClearImageBuffer()
+        except Exception:
+            pass
+        ret = self._cam.MV_CC_SetCommandValue("TriggerSoftware")
+        if ret != 0:
+            raise RuntimeError(f"TriggerSoftware failed ({_err(ret)})")
+
+    def _warmup(self, n):
+        """n trigger+grab rounds, frames discarded (raw buffer path, no
+        conversion). Best effort: a failure here is not a failed connect
+        — the verification grab that follows decides that."""
+        try:
+            for _ in range(int(n)):
+                self._trigger()
+                fr = _mv.MV_FRAME_OUT()
+                ctypes.memset(ctypes.byref(fr), 0, ctypes.sizeof(fr))
+                if self._cam.MV_CC_GetImageBuffer(fr, 2000) != 0:
+                    break
+                self._cam.MV_CC_FreeImageBuffer(fr)
+        except Exception:
+            pass
+
+    def net_stats(self):
+        """Stream health from the SDK's receiver: {"recv_frames",
+        "lost_frames", "lost_packets", "recv_bytes", "packet_delay"}.
+        Counted since StartGrabbing. {} when not streaming — the SDK
+        only answers while grabbing."""
+        with self._sdk_lock:
+            if self._cam is None or _mv is None:
+                return {}
+            try:
+                det = _mv.MV_MATCH_INFO_NET_DETECT()
+                ctypes.memset(ctypes.byref(det), 0, ctypes.sizeof(det))
+                info = _mv.MV_ALL_MATCH_INFO()
+                info.nType = _mv.MV_MATCH_TYPE_NET_DETECT
+                info.pInfo = ctypes.cast(ctypes.pointer(det), ctypes.c_void_p)
+                info.nInfoSize = ctypes.sizeof(det)
+                if self._cam.MV_CC_GetAllMatchInfo(info) != 0:
+                    return {}
+                return {"recv_frames": int(det.nNetRecvFrameCount),
+                        "lost_frames": int(det.nLostFrameCount),
+                        "lost_packets": int(det.nLostPacketCount),
+                        "recv_bytes": int(det.nReceiveDataSize),
+                        "packet_delay": int(getattr(self, "packet_delay_actual", 0))}
+            except Exception:
+                return {}
 
     # ── Intrinsics (mirrors Camera) ──────────────────────────────────
 
