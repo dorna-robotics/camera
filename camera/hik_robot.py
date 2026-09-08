@@ -1379,30 +1379,50 @@ class HikRobot(Helper):
         except Exception:
             return None
 
-    def _warmup(self, n=40, deadline_s=8.0):
+    def _warmup(self, n=40, deadline_s=30.0, window=4):
         """Adaptive warm-up: trigger+grab rounds, frames discarded, until
-        the image settles — as many frames as the scene needs, no more.
-        The settle signal is each frame's mean brightness (it captures
-        exposure AND gain converging, no feature reads): steady within
-        max(1%, 2 gray levels) for 3 consecutive frames. No brightness →
-        ExposureTime readback within 2% for 3 frames; no signal at all →
-        a fixed 12 frames. A warm camera exits in ~4 frames; a cold dark
-        boot gets the ~24 it was measured to need (MV-CU060-10GC).
+        auto exposure has settled — as many frames as the scene needs, no
+        more. Judged on a WINDOW of the last ``window`` frames, on every
+        signal that can be read, and settled only when ALL of them are
+        flat across the window:
 
-        Cannot hang, cannot fail the connect: hard-capped at ``n`` frames
-        AND ``deadline_s`` wall-clock (each grab's own timeout is 2 s, so
-        the frame cap alone would let a stalled stream spin for 80 s);
-        any exception returns quietly; every grabbed buffer is freed. A
-        grab timeout BEFORE the first frame is routine — the GigE stream
-        channel is still coming up after StartGrabbing, and bailing there
-        is how a "warmed-up" connect still hands the caller a black first
-        frame — so up to 3 of those are retried; a miss AFTER frames have
-        flowed is a dead stream and stops the burst at once. Best effort:
-        the verification grab that follows decides the connect."""
+          - frame mean brightness, within max(1%, 2 gray levels);
+          - ExposureTime, within 2%;
+          - Gain, within 0.5 dB.
+
+        Why all three, measured 2026-09-07 on two MV-CU060-10GC:
+          - consecutive-frame deltas were the first bug: a cold dark ramp
+            climbs ~2 gray levels a frame, three small steps read as
+            "steady", the burst stopped with the image still dark. A
+            window sees the spread of a ramp; a real plateau has none.
+          - pixels alone were the second bug: on the darker camera the
+            first frames are pitch black (mean ~1) — flat, because the
+            image is clipped at the floor while exposure is still
+            climbing behind it. ExposureTime/Gain are what the algorithm
+            actually moves, and they keep moving through a black image;
+            they flatten only when it has truly finished (or hit its
+            limit, in which case nothing more is coming anyway).
+        Unreadable signals are skipped (entry models without a Gain
+        node); no readable signal at all → a fixed 12 frames. A warm
+        camera exits in 4 frames; a cold dark boot rides its ~24-frame
+        climb to the top.
+
+        Cannot hang, cannot fail the connect. The hang guard is the miss
+        logic: a grab timeout BEFORE the first frame is routine (the GigE
+        stream channel is still coming up after StartGrabbing) and up to
+        3 are retried; a miss AFTER frames have flowed is a dead stream
+        and stops the burst at once — a dead stream costs at most ~6 s.
+        The frame cap ``n`` bounds a scene that never settles. The
+        wall-clock ``deadline_s`` is only a backstop for a pathological
+        slow-but-alive stream and is deliberately generous: a full burst
+        legitimately takes up to ~10 s here (6 MB frames plus the ramp),
+        and an earlier 8 s deadline cut exactly that short. Any exception
+        returns quietly; every grabbed buffer is freed. Best effort: the
+        verification grab that follows decides the connect."""
         try:
             deadline = time.monotonic() + float(deadline_s)
-            steady = blind = misses = frames = 0
-            last_kind = last_val = None
+            blind = misses = frames = 0
+            hist = {"mean": [], "expo": [], "gain": []}
             for _ in range(int(n)):
                 if time.monotonic() >= deadline:
                     return
@@ -1415,7 +1435,7 @@ class HikRobot(Helper):
                         return          # dead stream — stop asking
                     continue            # stream still coming up
                 try:
-                    val = self._frame_mean(fr)
+                    mean = self._frame_mean(fr)
                 finally:
                     try:
                         self._cam.MV_CC_FreeImageBuffer(fr)
@@ -1423,28 +1443,40 @@ class HikRobot(Helper):
                         pass
                 frames += 1
                 misses = 0
-                kind = "mean"
-                if val is None:
-                    kind = "expo"
+                sample = {"mean": mean}
+                for key, node in (("expo", "ExposureTime"), ("gain", "Gain")):
                     try:
-                        val = self._get_float("ExposureTime")
+                        sample[key] = float(self._get_float(node))
                     except Exception:
-                        val = None
-                if val is None:
+                        sample[key] = None
+                if all(v is None for v in sample.values()):
                     blind += 1          # no signal: run the fixed count
                     if blind >= 12:
                         return
                     continue
-                tol = (max(2.0, 0.01 * last_val) if kind == "mean"
-                       else 0.02 * max(last_val, 1e-6)) \
-                    if kind == last_kind else None
-                if tol is not None and abs(val - last_val) <= tol:
-                    steady += 1
-                    if steady >= 3:
-                        return
-                else:
-                    steady = 0
-                last_kind, last_val = kind, val
+                for key, val in sample.items():
+                    if val is not None:
+                        hist[key] = (hist[key] + [float(val)])[-int(window):]
+                readable = [k for k in hist if hist[k]]
+                if not readable or any(len(hist[k]) < int(window)
+                                       for k in readable):
+                    continue
+                flat = True
+                for k in readable:
+                    vals = hist[k]
+                    center = sum(vals) / len(vals)
+                    tol = {"mean": max(2.0, 0.01 * center),
+                           "expo": 0.02 * max(center, 1e-6),
+                           "gain": 0.5}[k]
+                    if max(vals) - min(vals) > tol:
+                        flat = False
+                        break
+                    if k == "mean" and readable == ["mean"] and \
+                            not (8.0 < center < 247.0):
+                        flat = False    # clipped and blind: not settled
+                        break
+                if flat:
+                    return              # every signal flat: settled
         except Exception:
             pass
 

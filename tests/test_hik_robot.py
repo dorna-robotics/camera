@@ -440,14 +440,51 @@ def test_warmup_converges_early_on_a_stable_scene(warming, monkeypatch):
 
 def test_warmup_rides_the_ramp_and_stops_at_the_plateau(warming, monkeypatch):
     # Cold dark boot: brightness climbs frame by frame; the burst keeps
-    # feeding the algorithm through the climb and stops 3 frames into
-    # the plateau — no fixed count involved.
+    # feeding the algorithm through the climb and stops once the last 4
+    # frames are flat — no fixed count involved.
     c, log = warming
     means = [10, 30, 60, 90, 110, 120, 121, 121.5, 122]
     monkeypatch.setattr(HikRobot, "_frame_mean",
                         lambda self, fr: means.pop(0) if len(means) > 1 else means[0])
     c._warmup()
-    assert log.triggers == 9            # 6 climbing + 3 steady
+    assert log.triggers == 9            # first flat window: 120..122
+
+
+def test_warmup_does_not_mistake_a_slow_ramp_for_a_plateau(warming, monkeypatch):
+    # THE bug measured on the bench: a cold dark camera climbs ~2 gray
+    # levels per frame. Consecutive deltas within tolerance used to read
+    # as "steady" after 3 frames and the burst stopped with the image
+    # still dark. The window test sees the spread of the ramp and rides
+    # it to the top.
+    c, log = warming
+    ramp = [20 + 2 * i for i in range(20)] + [60] * 10     # +2/frame, then flat
+    monkeypatch.setattr(HikRobot, "_frame_mean",
+                        lambda self, fr: ramp.pop(0) if len(ramp) > 1 else ramp[0])
+    c._warmup()
+    assert log.triggers >= 20                   # never stopped on the ramp
+    assert log.triggers <= 24                   # settled within 4 of the plateau
+
+
+def test_warmup_sees_through_a_black_clipped_image(warming, monkeypatch):
+    # THE bug on the darker camera: its first frames are pitch black
+    # (mean ~1), i.e. flat — while exposure is still climbing behind the
+    # clipped image. Exposure must veto "settled" until it flattens too.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", lambda self, fr: 1.0)
+    log.exposures = [100 * 1.3 ** i for i in range(16)] + [5000.0] * 10  # climb, then flat
+    c._warmup()
+    assert log.triggers >= 17                   # rode the whole exposure climb
+    assert log.triggers <= 21                   # settled within 4 of exposure flattening
+
+
+def test_warmup_black_image_with_no_exposure_signal_runs_to_the_cap(warming, monkeypatch):
+    # Pixels flat at the floor and nothing else readable: never declare a
+    # black image settled on pixels alone — run to the frame cap.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", lambda self, fr: 1.0)
+    monkeypatch.setattr(c, "_get_float", lambda key: (_ for _ in ()).throw(RuntimeError(key)))
+    c._warmup()
+    assert log.triggers == 40
 
 
 def test_warmup_never_exceeds_the_frame_cap(warming, monkeypatch):
@@ -457,17 +494,33 @@ def test_warmup_never_exceeds_the_frame_cap(warming, monkeypatch):
     assert log.triggers == 40           # exactly the cap, never more
 
 
-def test_warmup_stops_on_the_wall_clock_deadline(warming, monkeypatch):
-    # Slow grabs: the 8 s wall clock stops the burst long before the
-    # 40-frame cap would. Fake clock — 2 "seconds" per look.
-    c, log = warming
-    monkeypatch.setattr(HikRobot, "_frame_mean", _unstable_mean())
+def _fake_clock(monkeypatch, step):
     clock = [0.0]
 
     def monotonic():
-        clock[0] += 2.0
-        return clock[0] - 2.0
+        clock[0] += step
+        return clock[0] - step
     monkeypatch.setattr(hik.time, "monotonic", monotonic)
+
+
+def test_warmup_deadline_is_a_backstop_not_the_limit(warming, monkeypatch):
+    # A real burst costs ~0.25 s a frame on the bench (6 MB frames + the
+    # exposure ramp) — 40 frames is ~10 s. The old 8 s deadline cut that
+    # ramp short and handed back a dark first frame. With frames flowing
+    # the FRAME CAP must be what stops a scene that never settles.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", _unstable_mean())
+    _fake_clock(monkeypatch, 0.25)
+    c._warmup()
+    assert log.triggers == 40           # the cap, not the clock
+
+
+def test_warmup_stops_on_the_wall_clock_deadline(warming, monkeypatch):
+    # Pathological slow-but-alive stream (10 "seconds" per frame): the
+    # wall clock is what ends it, long before the 40-frame cap.
+    c, log = warming
+    monkeypatch.setattr(HikRobot, "_frame_mean", _unstable_mean())
+    _fake_clock(monkeypatch, 10.0)
     c._warmup()
     assert 0 < log.triggers <= 4        # deadline, not the frame cap
 
