@@ -681,14 +681,16 @@ class UEyeXS(Helper):
     #    knob for output brightness. ─────────────────────────────────
 
     def get_exposure(self):
-        """Current exposure time in ms — whatever the ISP's auto chose."""
+        """Current exposure time in µs — whatever the ISP's auto chose.
+        µs is every camera driver's unit (D405, HikRobot, Oak); the uEye
+        SDK reports ms, converted here."""
         if self._h is None:
             raise RuntimeError("uEye camera not connected")
         v = ueye.c_double(0)
         with self._sdk_lock:
             ueye.is_Exposure(self._h, ueye.IS_EXPOSURE_CMD_GET_EXPOSURE,
                              v, ueye.sizeof(v))
-        return round(float(v.value), 3)
+        return round(float(v.value) * 1000.0, 1)
 
     def set_exposure(self, exposure, _locked=True):
         raise RuntimeError(
