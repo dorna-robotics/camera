@@ -25,8 +25,10 @@ What is different, stated instead of papered over:
   camera matrix and the 14-coefficient (OpenCV rational) distortion of
   EXACTLY the frame delivered — after the device's own crop/scale — come
   with every frame (``ImgFrame.getTransformation``). The full-resolution
-  output is a 4000 x 3000 centre crop of the 4056 x 3040 sensor, and the
-  matrix says so. Authored ``K``/``D``/``native_res`` still override.
+  stream is the whole 4056 x 3040 sensor, in the ISP's own YUV420
+  format: asking for any other format sends the frame through a
+  conversion that crops it to 4000 x 3000 (measured). Authored
+  ``K``/``D``/``native_res`` still override.
 - **Fresh frames.** The camera streams; ``get_all`` returns the first
   frame whose exposure STARTED after the call (device timestamps are
   synced to the host clock), never a buffered one.
@@ -70,10 +72,10 @@ except Exception as _ex:     # absent or broken install — say so at use
 
 _WARNED = {"sdk": False}
 
-# The full-resolution stream: every pixel the sensor gives, at a rate a
-# USB 3 link and the host carry without strain (12 MP NV12 ~ 18 MB a
-# frame). The output is NV12 (half the bytes of BGR over the link); the
-# host converts the frames it actually uses.
+# The full-resolution stream: every pixel the sensor gives (4056 x 3040),
+# at a rate a USB 3 link and the host carry without strain (12 MP YUV420
+# ~ 18 MB a frame — half the bytes of BGR over the link); the host
+# converts the frames it actually uses.
 DEFAULT_FPS = 10
 # How long a setter waits for the frames to show its change, and how
 # long a grab waits for a fresh frame.
@@ -215,7 +217,7 @@ class Oak(Helper):
     def connect(
         self,
         serial_number="",
-        stream=None,          # {"width","height","fps"}; None = full resolution at DEFAULT_FPS
+        stream=None,          # {"width","height","fps"}; None = the full 4056 x 3040 at DEFAULT_FPS
         K=None,
         D=None,
         native_res=None,
@@ -293,7 +295,9 @@ class Oak(Helper):
             out = cam.requestOutput((int(stream["width"]), int(stream["height"])),
                                     dai.ImgFrame.Type.NV12, fps=fps)
         else:
-            out = cam.requestFullResolutionOutput(dai.ImgFrame.Type.NV12, fps=fps)
+            # NO type: the ISP's own YUV420 frame, the whole 4056 x 3040.
+            # Any explicit type adds a conversion that crops to 4000 x 3000.
+            out = cam.requestFullResolutionOutput(fps=fps)
         self._q = out.createOutputQueue(maxSize=1, blocking=False)
         self._ctl = cam.inputControl.createInputQueue()
         self._pipeline = p
