@@ -39,9 +39,14 @@ Differences from the D405, stated instead of papered over:
 - **Exposure / gain are real knobs.** Unlike the uEye XS, the sensor is
   fully controllable: ``exposure`` in µs pins ExposureAuto=Off +
   ExposureTime (same unit the D405 uses); ``exposure=None`` leaves the
-  camera in continuous auto. ``gain`` (dB) works the same way.
+  camera in continuous auto. ``gain`` (dB) works the same way. Both
+  are live too: ``set_exposure`` / ``auto_exposure`` / ``get_exposure``
+  and ``set_gain`` / ``auto_gain`` / ``get_gain``.
 - **White balance.** ``{"auto": True}`` continuous, ``{"once": True}``
-  converge then hold, ``{"hold": True}`` freeze the current ratios.
+  converge then hold, ``{"hold": True}`` freeze the current ratios,
+  ``{"ratios": {"red": r, "green": g, "blue": b}}`` pin them (BalanceRatio,
+  1024 = unity — what ``white_balance_info`` reads back, so a measured
+  balance is written as numbers, not re-converged).
 - **On demand by default.** ``acquisition="trigger"``: the camera is
   armed and silent; every grab software-triggers ONE frame, exposed at
   that moment, and the link carries nothing in between — so any number
@@ -425,6 +430,7 @@ class HikRobot(Helper):
         self._enabled_channels = {"color"}
 
         self.exposure_auto = True
+        self.gain_auto = True
         self.wb_cfg = {"auto": True}
 
         # replug watcher (presence monitor over GigE discovery)
@@ -689,6 +695,12 @@ class HikRobot(Helper):
         if self._cam.MV_CC_GetEnumValue(key, v) != 0:
             raise RuntimeError(f"GetEnumValue({key}) failed")
         return int(v.nCurValue)
+
+    def _has_enum(self, key):
+        """True when the camera has the enum node ``key``."""
+        v = _mv.MVCC_ENUMVALUE()
+        ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
+        return self._cam.MV_CC_GetEnumValue(key, v) == 0
 
     def _read_string(self, key):
         v = _mv.MVCC_STRINGVALUE()
@@ -1093,15 +1105,15 @@ class HikRobot(Helper):
             cam.MV_CC_SetEnumValue("ExposureAuto", 2)   # Continuous
             self.exposure_auto = True
 
-        # gain: manual (dB) pins GainAuto=Off; None = continuous auto
-        try:
-            if gain is not None:
-                cam.MV_CC_SetEnumValue("GainAuto", 0)
-                cam.MV_CC_SetFloatValue("Gain", float(gain))
-            else:
-                cam.MV_CC_SetEnumValue("GainAuto", 2)
-        except Exception:
-            pass   # mono/entry models without a Gain node
+        # gain: manual (dB) pins GainAuto=Off; None = continuous auto. A
+        # model without a GainAuto node (mono/entry) has no auto to turn
+        # on; an authored gain on one fails loudly in set_gain.
+        if gain is not None:
+            self.set_gain(gain, _locked=False)
+        elif self._has_enum("GainAuto"):
+            self.auto_gain(True, _locked=False)
+        else:
+            self.gain_auto = None
 
         # white balance: authored cfg else continuous auto
         self.white_balance(wb or {"auto": True}, _locked=False)
@@ -1119,7 +1131,8 @@ class HikRobot(Helper):
         # warm camera costs ~4 frames and a cold dark boot gets the ~24
         # it was measured to need; capped at 40 frames / 8 s wall-clock.
         if self._acquisition != "continuous" and (
-                exposure is None or gain is None or not wb or wb.get("auto")):
+                exposure is None or gain is None or not wb
+                or wb.get("auto") or wb.get("once")):
             self._warmup()
 
         # intrinsics: authored (scaled from native_res) else nominal
@@ -1646,12 +1659,75 @@ class HikRobot(Helper):
                 return round(self._get_float("ExposureTime"), 1)
         return self._control_op(body) if _locked else body()
 
+    # ── Gain ─────────────────────────────────────────────────────────
+    # The sensor's analog gain, in dB — the GigE camera's ISO. 0 dB adds
+    # no noise; auto gain drifts brightness from capture to capture.
+
+    def get_gain(self):
+        """Current gain in dB."""
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            with self._sdk_lock:
+                return round(self._get_float("Gain"), 2)
+        return self._control_op(body)
+
+    def set_gain(self, gain, _locked=True):
+        """Pin manual gain, in dB (GainAuto=Off)."""
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            lock = self._sdk_lock if _locked else _NullCtx()
+            with lock:
+                ret = self._cam.MV_CC_SetEnumValue("GainAuto", 0)   # Off
+                if ret != 0:
+                    raise RuntimeError(f"GainAuto off failed ({_err(ret)})")
+                ret = self._cam.MV_CC_SetFloatValue("Gain", float(gain))
+                if ret != 0:
+                    raise RuntimeError(f"Gain set failed ({_err(ret)})")
+                self.gain_auto = False
+                return round(self._get_float("Gain"), 2)
+        return self._control_op(body) if _locked else body()
+
+    def auto_gain(self, enable=True, _locked=True):
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            lock = self._sdk_lock if _locked else _NullCtx()
+            with lock:
+                ret = self._cam.MV_CC_SetEnumValue("GainAuto", 2 if enable else 0)
+                if ret != 0:
+                    raise RuntimeError(f"GainAuto set failed ({_err(ret)})")
+                self.gain_auto = bool(enable)
+                return round(self._get_float("Gain"), 2)
+        return self._control_op(body) if _locked else body()
+
     # ── White balance ────────────────────────────────────────────────
 
     def white_balance(self, cfg, _locked=True):
         """{"auto": True} continuous, {"once": True} converge-then-hold,
-        {"hold": True} freeze the current ratios."""
+        {"hold": True} freeze the current ratios, {"ratios": {"red": r,
+        "green": g, "blue": b}} pin them (BalanceRatio, 1024 = unity)."""
         cfg = dict(cfg or {})
+        if cfg.get("ratios"):
+            ratios = {k: int(cfg["ratios"][k]) for k in ("red", "green", "blue")}
+            def body():
+                if self._cam is None:
+                    raise RuntimeError("Hikrobot camera not connected")
+                lock = self._sdk_lock if _locked else _NullCtx()
+                with lock:
+                    ret = self._cam.MV_CC_SetEnumValue("BalanceWhiteAuto", 0)   # Off
+                    if ret != 0:
+                        raise RuntimeError(f"white balance set failed ({_err(ret)})")
+                    for name, sel in (("red", 0), ("green", 1), ("blue", 2)):
+                        ret = self._cam.MV_CC_SetEnumValue("BalanceRatioSelector", sel)
+                        if ret == 0:
+                            ret = self._cam.MV_CC_SetIntValue("BalanceRatio", ratios[name])
+                        if ret != 0:
+                            raise RuntimeError(f"BalanceRatio {name} set failed ({_err(ret)})")
+                self.wb_cfg = {"ratios": dict(ratios)}
+                return dict(self.wb_cfg)
+            return self._control_op(body) if _locked else body()
         if cfg.get("auto"):
             val, store = 2, {"auto": True}       # Continuous
         elif cfg.get("once"):
@@ -1660,7 +1736,8 @@ class HikRobot(Helper):
             val, store = 0, {"hold": True}       # Off (freeze current)
         else:
             raise ValueError(
-                'wb needs {"auto": True}, {"once": True} or {"hold": True}')
+                'wb needs {"auto": True}, {"once": True}, {"hold": True} '
+                'or {"ratios": {"red": r, "green": g, "blue": b}}')
 
         def body():
             if self._cam is None:
@@ -1674,6 +1751,23 @@ class HikRobot(Helper):
             self.wb_cfg = store
             return dict(self.wb_cfg)
         return self._control_op(body) if _locked else body()
+
+    def white_balance_info(self):
+        """The white balance in force: ``cfg`` as last set, and the
+        camera's current red / green / blue ratios (BalanceRatio, 1024 =
+        unity) — what a ``once`` settled on, what ``hold`` keeps."""
+        def body():
+            if self._cam is None:
+                raise RuntimeError("Hikrobot camera not connected")
+            ratios = {}
+            with self._sdk_lock:
+                for name, sel in (("red", 0), ("green", 1), ("blue", 2)):
+                    ret = self._cam.MV_CC_SetEnumValue("BalanceRatioSelector", sel)
+                    if ret != 0:
+                        raise RuntimeError(f"BalanceRatioSelector set failed ({_err(ret)})")
+                    ratios[name] = self._get_int("BalanceRatio")
+            return {"cfg": dict(self.wb_cfg), "ratios": ratios}
+        return self._control_op(body)
 
 
 class _TransientGrabError(RuntimeError):
